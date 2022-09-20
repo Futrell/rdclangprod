@@ -1,0 +1,3 @@
+import generalmodel
+
+generalmodel.figures()
