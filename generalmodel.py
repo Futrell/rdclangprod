@@ -211,7 +211,7 @@ def stop_R(R):
     new_R[(COLON,) + (slice(1,None,None),)*T] = R
     return new_R
 
-def encode_simple_lang(lang, epsilon=0.2, strength=None, init_pL=None):
+def encode_simple_lang(lang, epsilon=0.2, strength=None, epsilon_multiplier=None, init_pL=None):
     """ Reward tensor for listener model with
     p(w | x) \propto \epsilon + [x fits w]
     """
@@ -234,13 +234,17 @@ def encode_simple_lang(lang, epsilon=0.2, strength=None, init_pL=None):
                 assoc[(g,) + loc] = 1
     if strength is not None:
         assoc *= strength[(COLON,) + (None,)*T]
-    assoc += epsilon
+    if epsilon_multiplier is not None:
+        assoc += epsilon * epsilon_multiplier[(COLON,) + (None,)*T]
+    else:
+        assoc += epsilon
     # p(w | x) = 1/Z epsilon + assoc[w, x], where
     #        Z = \sum_w epsilon + assoc[w, x]
     Z = assoc.sum(0, keepdims=True)
     p_L = assoc / Z
     R = conditionalize(np.log(p_L))
     R[(COLON,) + (EMPTY,)*(T-1) + (COLON,)] -= np.log(init_pL)[:, None]
+    breakpoint()
     return R
 
 # p(w | xyz) = p(w) p(w|x)/p(w) p(w|xy)/p(w|x) p(w|xyz)/p(w|xy)
@@ -408,6 +412,14 @@ def substring_index(xs, ys):
         return -1
 
 def ab_listener_R(eps=1/5):
+    return encode_simple_lang([
+        ['aa'],
+        ['ab'],
+        ['ba'],
+        ['bb'],
+        ],
+        epsilon=eps
+    )
     assoc = ab_R(good=1, bad=0)
     p_xw = assoc + eps
     p_x = p_xw.sum(0, keepdims=True)
@@ -432,10 +444,12 @@ def ab_R(good=1, bad=-1):
     return np.ones_like(R)*bad + R*(good-bad)
 
 def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
-    R = uneven_listener(V,
-                        epsilon=epsilon,
-                        weight=weight)
-    R_padded = fp_R(pad_R(R, T=1), value=0)
+    R = uneven_listener(V, epsilon=epsilon, weight=weight)
+    R_diag = np.diag(R)
+    R_offdiag = (R - np.eye(V)*R_diag).sum(-1) / (V-1)
+    DR = R_diag - R_offdiag
+    
+    R_padded = fp_R(pad_R(R, T=1), value=0)    
     lnp, lnp0 = policy(R_padded,
                        gamma=gamma,
                        alpha=alpha,
@@ -443,12 +457,6 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
                        monitor=True,
                        init_temperature=100,
                        num_iter=1000)
-
-    R_diag = np.diag(R)
-    R_offdiag = np.zeros(V)
-    R_offdiag[1:] = np.diag(R, -1)
-    R_offdiag[0] = R[0,1]
-    DR = R_diag - R_offdiag
 
     policy_df = pd.DataFrame({
         'g': np.repeat(range(V), V+1) + 1,
@@ -458,6 +466,7 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
     })
 
     df = pd.DataFrame({
+        'g': range(V),
         'DR': DR,
         'p0(x)': np.exp(lnp0)[0, EMPTY, 1:],
         'p0(x|ε)': np.exp(lnp0)[0, 0, 1:],
@@ -469,17 +478,13 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
 
     return df, policy_df
 
-def uneven_listener(V, epsilon=1/5, weight=1, offset=0):
+def uneven_listener(V, epsilon=1/5, weight=1):
     # p(w | x) \propto \epsilon + [L(x) = w]
     # good with V=5, epsilon=.2, gamma=2, alpha=1
-    weights = np.zeros((V, V))
-    fill = np.array(range(1, V+1)) * weight + offset
-    np.fill_diagonal(weights, fill)
-    weights += epsilon
-    logprobs = np.log(weights) - np.log(weights.sum(-1, keepdims=True)) # p(w | x), shape W x X
-    denominator = -np.log(V)
-    return logprobs - denominator
-
+    return encode_simple_lang(list(map(list, map(str, range(V)))),
+                              epsilon=epsilon,
+                              epsilon_multiplier=1/(np.arange(V)+1)*weight)
+        
 
 def shortlong_grid(eps=1/5, offset=0, **kwds):
     def shortlong_pref(policies):
@@ -545,24 +550,14 @@ def grid(f, R, gamma_min=0, gamma_max=5, gamma_steps=100, alpha_min=0, alpha_max
 
     return df
 
-def codability_R():
-    # g1 -> {ab, ac, ba, ca}
-    # g2 -> {aa, bb, cc}
-    R = np.array([
+def codability_R(eps=1/5):
+    return encode_simple_lang(
         [
-            [0, 1, 1],  # a_
-            [1, 0, 0],  # b_
-            [1, 0, 0],  # c_
-            [1, 1, 1],  # 0_
+            ['ab', 'ac', 'ba', 'ca'],
+            ['aa', 'bb', 'cc'],
         ],
-        [
-            [1, 0, 0], # a_
-            [0, 1, 0], # b_
-            [0, 0, 1], # c_
-            [1, 1, 1]
-        ]
-    ])
-    return R
+        epsilon=eps,
+    )
 
 def shortlong_R(eps=1/5):
     return encode_simple_lang(
@@ -574,10 +569,6 @@ def shortlong_R(eps=1/5):
         ],
         epsilon=eps
     )
-
-#    p_xw_smoothed = p_xw + eps
-#    p_x_smoothed = p_xw_smoothed.sum(0, keepdims=True)
-#    return np.log(p_xw_smoothed) - np.log(p_x_smoothed) + np.log(3)
 
 def test_control_signal():
     # g1 -> aa
