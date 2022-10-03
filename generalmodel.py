@@ -7,7 +7,7 @@ import scipy.special
 import pandas as pd
 from plotnine import *
 import einops
-
+import rfutils
 
 INF = float('inf')
 EMPTY = -1
@@ -21,6 +21,23 @@ def the_unique(xs):
     for x in xs_it:
         assert x == first_value
     return first_value
+
+def first(xs):
+    for x in xs:
+        return x
+    else:
+        raise ValueError("Empty iterable passed to first")
+
+def all_same(xs):
+    first_time = True
+    for x in xs:
+        if first_time:
+            first_value = x
+            first_time = False
+        elif x != first_value:
+            return False
+    else:
+        return True
 
 def cartesian_indices(k, n):
     return itertools.product(*[range(k)]*n)
@@ -54,7 +71,11 @@ def integrate(x, B=0):
     return y
 
 def conditionalize(x, B=0):
-    """ transform a prefix tensor lnp(x_{\le t}) into lnp(x_t | x_{<t}) """
+    """ transform a prefix tensor
+    lnp(x_{\le t})
+    into
+    lnp(x_t | x_{<t}) = lnp(x_{\le t}) - lnp(x_{<t})
+    """
     T = x.ndim - B - 1
     y = x.copy()
     for _, prev, curr in reversed(list(backward_iterator(T))):
@@ -189,6 +210,40 @@ def stop_R(R):
     # fill in old values where appropriate
     new_R[(COLON,) + (slice(1,None,None),)*T] = R
     return new_R
+
+def encode_simple_lang(lang, epsilon=0.2, strength=None, init_pL=None):
+    """ Reward tensor for listener model with
+    p(w | x) \propto \epsilon + [x fits w]
+    """
+    lang = list(lang)
+    G = len(lang)
+    if init_pL is None:
+        init_pL = np.ones(G) / G    
+    T = len(lang[0][0])
+    assert all(len(x) == T for y in lang for x in y)
+    vocab = {x:i for i, x in enumerate(sorted(set(
+        char for goal in lang for utterance in goal for char in utterance
+    )))}
+    V = len(vocab)
+    assoc = np.zeros((G,) + (V+1,)*(T-1) + (V,))
+    for g, strings in enumerate(lang):
+        for string in strings:
+            for prefix in rfutils.buildup(str(string)):
+                S = len(prefix)
+                loc = (EMPTY,)*(T-S) + tuple(vocab[x] for x in prefix)
+                assoc[(g,) + loc] = 1
+    if strength is not None:
+        assoc *= strength[(COLON,) + (None,)*T]
+    assoc += epsilon
+    # p(w | x) = 1/Z epsilon + assoc[w, x], where
+    #        Z = \sum_w epsilon + assoc[w, x]
+    Z = assoc.sum(0, keepdims=True)
+    p_L = assoc / Z
+    R = conditionalize(np.log(p_L))
+    R[(COLON,) + (EMPTY,)*(T-1) + (COLON,)] -= np.log(init_pL)[:, None]
+    return R
+
+# p(w | xyz) = p(w) p(w|x)/p(w) p(w|xy)/p(w|x) p(w|xyz)/p(w|xy)
 
 def add_corr(R, corr_value=0):
     """ add correction action ! at index 0 which cancels all previous actions.
@@ -412,16 +467,7 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
 
     dfm = pd.melt(df, id_vars=['DR'])
 
-    plot = (
-        ggplot(dfm, aes(x='DR', y='value', color='variable')) +
-        geom_line(size=1) +
-        theme_classic() +
-        xlab("ΔR_g") +
-        ylab("Probability") +
-        theme(legend_position="bottom", legend_title=element_blank())
-     )
-
-    return df, policy_df, plot
+    return df, policy_df
 
 def uneven_listener(V, epsilon=1/5, weight=1, offset=0):
     # p(w | x) \propto \epsilon + [L(x) = w]
@@ -433,7 +479,8 @@ def uneven_listener(V, epsilon=1/5, weight=1, offset=0):
     logprobs = np.log(weights) - np.log(weights.sum(-1, keepdims=True)) # p(w | x), shape W x X
     denominator = -np.log(V)
     return logprobs - denominator
-    
+
+
 def shortlong_grid(eps=1/5, offset=0, **kwds):
     def shortlong_pref(policies):
         p_short = np.exp(policies[:, :, 0, EMPTY, EMPTY, 0])
@@ -518,131 +565,19 @@ def codability_R():
     return R
 
 def shortlong_R(eps=1/5):
-    # g1 -> abc or bca
-    # g2 -> bcd or dbc
-    # g3 -> ad or dd
+    return encode_simple_lang(
+        [
+            ["abc", "bca"],
+            ["bcd", "dbc"],
+            ["ada", "adb", "adc", "add",
+             "daa", "dab", "dac", "dad"],
+        ],
+        epsilon=eps
+    )
 
-    # want: p_L(w | x) \propto \epsilon + [x \in X_w]
-    
-    # p_L(w | x) = p_L(x | w) * p(w) / p_L(x)
-    # p(w) is uniform and will cancel, so
-    # p_L(w | x) = p_L(x | w) / p_L(x)
-    #            = [x \in X_w] + \epsilon / (\sum_w [x \in X_w] + \epsilon)
-
-    
-    p_xw = np.array([
-        [ # g1 -> abc or bca
-            [
-                [0, 0, 0, 0], # aa_
-                [0, 0, 1, 0], # ab_ !!!!!!!!!!!!
-                [0, 0, 0, 0], # ac_
-                [0, 0, 0, 0], # ad_
-                [0, 0, 0, 0], # a0_
-             ],
-            [
-                [0, 0, 0, 0], # ba_
-                [0, 0, 0, 0], # bb_
-                [1, 0, 0, 0], # bc_ !!!!!!!!!!!!
-                [0, 0, 0, 0], # bd_
-                [0, 0, 0, 0], # b0_
-            ],
-            [ # c__
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ],
-            [ # d__
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ],
-            [ # 0__
-                [0, 1, 0, 0],  # 0a_
-                [0, 0, 1, 0],  # 0b_ -> c
-                [0, 0, 0, 0],  # 0c_
-                [0, 0, 0, 0],  # 0d_
-                [1, 1, 0, 0],  # 00_
-            ],
-        ], [ # g2 -> bc, d or d, bc
-            [
-                [0, 0, 0, 0], # aa_
-                [0, 0, 0, 0], # ab_
-                [0, 0, 0, 0], # ac_
-                [0, 0, 0, 0], # ad_
-                [0, 0, 0, 0], # a0_
-             ],
-            [
-                [0, 0, 0, 0], # ba_
-                [0, 0, 0, 0], # bb_
-                [0, 0, 0, 1], # bc_
-                [0, 0, 0, 0], # bd_
-                [0, 0, 0, 0], # b0_
-            ],
-            [ # c__
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ],
-            [ # d__
-                [0, 0, 0, 0], # da_
-                [0, 0, 1, 0], # db_
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ],
-            [ # 0__
-                [0, 0, 0, 0],  # 0a_
-                [0, 0, 1, 0],  # 0b_ -> c
-                [0, 0, 0, 0],  # 0c_
-                [0, 1, 0, 0],  # 0d_
-                [0, 1, 0, 1],  # 00_
-            ],
-        ], [ # g3
-            [
-                [0, 0, 0, 0], # aa_
-                [0, 0, 0, 0], # ab_
-                [0, 0, 0, 0], # ac_
-                [0, 0, 0, 0], # ad_
-                [0, 0, 0, 0], # a0_
-             ],
-            [
-                [0, 0, 0, 0], 
-                [0, 0, 0, 0], 
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ],
-            [ # c__
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-            ],
-            [ # d__
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],
-                [0, 0, 0, 0],                
-            ],
-            [ # 0__
-                [0, 0, 0, 1],  # 0a_
-                [0, 0, 0, 0],  # 0b_ -> c
-                [0, 0, 0, 0],  # 0c_
-                [1, 0, 0, 0],  # 0d_
-                [1, 0, 0, 1],  # 00_
-            ]
-        ]])
-    p_xw_smoothed = p_xw + eps
-    p_x_smoothed = p_xw_smoothed.sum(0, keepdims=True)
-    return np.log(p_xw_smoothed) - np.log(p_x_smoothed) + np.log(3)
+#    p_xw_smoothed = p_xw + eps
+#    p_x_smoothed = p_xw_smoothed.sum(0, keepdims=True)
+#    return np.log(p_xw_smoothed) - np.log(p_x_smoothed) + np.log(3)
 
 def test_control_signal():
     # g1 -> aa
@@ -1014,7 +949,7 @@ def figures():
 
     # filled pause
     print("Generating filled-pause simulations...", file=sys.stderr)
-    df, policy, _ = fp_figures()
+    df, policy = fp_figures()
     df.to_csv("output/fp_summary.csv")
     policy.to_csv("output/fp_policy.csv")
 
