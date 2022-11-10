@@ -118,7 +118,7 @@ rdc_rel = linspace(min(d$rel_distance), max(d$rel_distance), 100) %>%
   mutate(p=sigmoid(intercept_rel + gamma_rel*rel_distance + offset_rel*freqdiff1),
          type="Model")
 
-d3 %>%
+d4 %>%
   mutate(R_bin=cut_width(rel_distance, max(rel_distance)/4)) %>%
   group_by(R_bin) %>%
     mutate(rel_distance=mean(rel_distance)) %>%

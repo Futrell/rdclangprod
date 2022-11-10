@@ -1,9 +1,9 @@
 setwd("~/projects/control/code/dative")
 rm(list=ls())
-library(tidyverse)
 library(lme4)
 library(brms)
 library(languageR)
+library(tidyverse)
 
 datives = read_csv("datives-finalized.csv") 
 dg = read_csv("datives_flipped_gpt3.csv") %>% rename(Token.ID=id)
@@ -33,21 +33,42 @@ d = inner_join(datives, dg) %>%
     Theme.animacy == "L" ~ 0,
     Theme.animacy == "I" ~ 0    
   )) %>%
+  mutate(Theme.charlength=str_length(Theme),
+         Recipient.charlength=str_length(Recipient)) %>%
   mutate(
     D.definiteness = Recipient.definiteness.numeric - Theme.definiteness.numeric,
     D.animacy = Recipient.animacy.numeric - Theme.animacy.numeric,
     D.logprob_both = logprob_D_both - logprob_P_both,
     D.logprob_first = logprob_recipient_in_context - logprob_theme_in_context,
     D.logprob_plan_both = D.logprob_both - D.logprob_first,
+    D.length = Recipient.length - Theme.length,
+    D.charlength = Recipient.charlength - Theme.charlength
   )
 
 
-ml = glmer(DO ~ D.definiteness + D.animacy + D.logprob_first + D.logprob_plan_both + Semantics.reduced + (1 | Speaker), 
+ml = glmer(DO ~ D.definiteness + 
+             D.animacy + 
+             D.charlength +
+             D.logprob_first + 
+             D.logprob_plan_both + 
+             Semantics.reduced + 
+             (1 | Speaker), 
         data=d, family="binomial")
 
 m = brm(DO ~ 
-          D.definiteness + D.animacy + D.logprob_first + D.logprob_plan_both + Semantics.reduced + 
-          (1 + D.definiteness + D.animacy + D.logprob_first + D.logprob_plan_both + Semantics.reduced | Speaker), 
+          D.definiteness + 
+          D.animacy + 
+          D.charlength +
+          D.logprob_first + 
+          D.logprob_plan_both + 
+          Semantics.reduced + 
+          (1 + 
+             D.definiteness + 
+             D.animacy + 
+             D.charlength +
+             D.logprob_first + 
+             D.logprob_plan_both + 
+             Semantics.reduced | Speaker), 
         data=d, family="bernoulli")
 
 hypothesis(m, "D.logprob_first = 0")

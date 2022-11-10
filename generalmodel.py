@@ -1,11 +1,11 @@
 import sys
+import random
 import itertools
 
 import tqdm
 import numpy as np
 import scipy.special
 import pandas as pd
-from plotnine import *
 import einops
 import rfutils
 
@@ -21,23 +21,6 @@ def the_unique(xs):
     for x in xs_it:
         assert x == first_value
     return first_value
-
-def first(xs):
-    for x in xs:
-        return x
-    else:
-        raise ValueError("Empty iterable passed to first")
-
-def all_same(xs):
-    first_time = True
-    for x in xs:
-        if first_time:
-            first_value = x
-            first_time = False
-        elif x != first_value:
-            return False
-    else:
-        return True
 
 def cartesian_indices(k, n):
     return itertools.product(*[range(k)]*n)
@@ -95,11 +78,23 @@ def backward_iterator(T):
         cont_address = (...,) + (EMPTYSLICE,)*(t-1) + (NONEMPTY,)*(T-t) + (COLON,)
         yield t, curr_address, cont_address
 
-def passive_dynamics(p_g, lnp, B=0):
+def stationary_policy(p_g, lnp, B=0):
+    # p(x) = \sum_{x_{\le t}} p(x_{\le t}) [x_{\le t} ends in x]
+    T = lnp.ndim - B - 1
+    joint = integrate(lnp, B=B) # lnp(x_{\le t} | g, t)
+    t = np.zeros_like(lnp)
+    for tau in range(T):
+        t[(COLON,) + (EMPTY,) * (T-tau) + (NONEMPTY,)*tau] = tau
+    
+    marginal = scipy.special.logsumexp(np.log(p_g[(...,) + (None,)*T]) + joint, B, keepdims=True) # ln p(x_{\le t} | t), 1xCx...xCxX
+    
+    mask = ...
+
+def automatic_policy(p_g, lnp, B=0):
     """ transform p(g) and ln p(x_t | g, x_{<t}) into ln p(x_t | x_{<t}) """
     joint = integrate(lnp, B=B) # ln p(x_{\le t} | g)
     T = lnp.ndim - B - 1
-    marginal = scipy.special.logsumexp(np.log(p_g[(...,) + (None,)*T]) + joint, B, keepdims=True) # ln p(x_{\le t})
+    marginal = scipy.special.logsumexp(np.log(p_g[(...,) + (None,)*T]) + joint, B, keepdims=True) # ln p(x_{\le t} | t)
     return conditionalize(marginal, B=B)
 
 def value_to_go(lnp, local_value, alpha=1, B=0):
@@ -113,6 +108,17 @@ def value_to_go(lnp, local_value, alpha=1, B=0):
         v[curr] = v[curr] + alpha * shift_right(continuation_value, B + 1)
     return v
 
+def objective(R, lnp, gamma, alpha, p_g=None, B=0):
+    if p_g is None:
+        G = R.shape[B]
+        p_g = np.ones(G) / G
+    T = lnp.ndim - B - 1            
+    lnp0 = automatic_policy(p_g, lnp, B=B)
+    control_cost = lnp - lnp0
+    local_value = gamma * R - control_cost
+    v = value_to_go(lnp, local_value, alpha, B=B)
+    return (p_g[(...,) + (None,)*T] * v).sum()
+
 def control_signal(R, lnp, lnp0, gamma, alpha, B=0):
     control_cost = lnp - lnp0
     local_value = gamma*R - control_cost
@@ -123,14 +129,14 @@ def policy(R,
            p_g=None,
            gamma=1,
            alpha=1,
-           num_iter=100,
+           num_iter=1000,
            init_temperature=100,
            B=0,
-           debug=False,
+           tie_init=True,
            force_index=0,
            force=0,
+           debug=False,           
            monitor=False,
-           tie_init=True,
            return_default=False):
     # R_g : a tensor G x C ... C x X with conditional rewards
     assert B >= 0
@@ -149,7 +155,7 @@ def policy(R,
     # Policy iteration
     iterations = tqdm.tqdm(range(num_iter)) if monitor else range(num_iter)
     for i in iterations:
-        lnp0 = passive_dynamics(p_g, lnp, B=B)
+        lnp0 = automatic_policy(p_g, lnp, B=B)
         u = control_signal(R, lnp, lnp0, gamma, alpha, B=B)
         if debug:
             breakpoint()
@@ -211,41 +217,67 @@ def stop_R(R):
     new_R[(COLON,) + (slice(1,None,None),)*T] = R
     return new_R
 
-def encode_simple_lang(lang, epsilon=0.2, strength=None, epsilon_multiplier=None, init_pL=None):
+class SimpleFixedLengthListener:
+    def __init__(self, assoc, init_p_L=None):
+        self.assoc = assoc
+        self.V = self.assoc.shape[-1]
+        self.T = len(self.assoc.shape) - 1
+        self.G = self.assoc.shape[0]
+        if init_p_L is None:
+            self.init_p_L = np.ones(self.G) / self.G
+        else:
+            self.init_p_L = init_p_L
+
+    @classmethod
+    def from_strings(cls, lang, init_p_L=None):
+        lang = list(lang)
+        G = len(lang)
+        T = len(lang[0][0])
+        assert all(len(x) == T for y in lang for x in y)
+        vocab = {x:i for i, x in enumerate(sorted(set(
+            char for goal in lang for utterance in goal for char in utterance
+        )))}
+        V = len(vocab)
+        assoc = np.zeros((G,) + (V+1,)*(T-1) + (V,))
+        for g, strings in enumerate(lang):
+            for string in strings:
+                for prefix in rfutils.buildup(string):
+                    S = len(prefix)
+                    loc = (EMPTY,)*(T-S) + tuple(vocab[x] for x in prefix)
+                    assoc[(g,) + loc] = 1
+        return cls(assoc, init_p_L)
+
+    def p_L(self, epsilon=.02, strength=None, epsilon_multiplier=None):
+        assoc = self.assoc
+        if strength is not None:
+            assoc = assoc * strength[(COLON,) + (None,)*self.T]
+        if epsilon_multiplier is not None:
+            assoc = assoc + epsilon * epsilon_multiplier[(COLON,) + (None,)*self.T]
+        else:
+            assoc = assoc + epsilon
+        # p(w | x) = 1/Z epsilon + assoc[w, x], where
+        #        Z = \sum_w epsilon + assoc[w, x]
+        Z = assoc.sum(0, keepdims=True)
+        p_L = assoc / Z
+        return p_L
+
+    def R(self, **kwds):
+        """ Reward tensor. """
+        p_L = self.p_L(**kwds)
+        R = conditionalize(np.log(p_L))
+        R[(COLON,) + (EMPTY,)*(self.T-1) + (COLON,)] -= np.log(self.init_p_L)[:, None]
+        return R
+        
+def encode_simple_lang(lang,
+                       epsilon=0.2,
+                       strength=None,
+                       epsilon_multiplier=None,
+                       init_p_L=None):
     """ Reward tensor for listener model with
     p(w | x) \propto \epsilon + [x fits w]
     """
-    lang = list(lang)
-    G = len(lang)
-    if init_pL is None:
-        init_pL = np.ones(G) / G    
-    T = len(lang[0][0])
-    assert all(len(x) == T for y in lang for x in y)
-    vocab = {x:i for i, x in enumerate(sorted(set(
-        char for goal in lang for utterance in goal for char in utterance
-    )))}
-    V = len(vocab)
-    assoc = np.zeros((G,) + (V+1,)*(T-1) + (V,))
-    for g, strings in enumerate(lang):
-        for string in strings:
-            for prefix in rfutils.buildup(str(string)):
-                S = len(prefix)
-                loc = (EMPTY,)*(T-S) + tuple(vocab[x] for x in prefix)
-                assoc[(g,) + loc] = 1
-    if strength is not None:
-        assoc *= strength[(COLON,) + (None,)*T]
-    if epsilon_multiplier is not None:
-        assoc += epsilon * epsilon_multiplier[(COLON,) + (None,)*T]
-    else:
-        assoc += epsilon
-    # p(w | x) = 1/Z epsilon + assoc[w, x], where
-    #        Z = \sum_w epsilon + assoc[w, x]
-    Z = assoc.sum(0, keepdims=True)
-    p_L = assoc / Z
-    R = conditionalize(np.log(p_L))
-    R[(COLON,) + (EMPTY,)*(T-1) + (COLON,)] -= np.log(init_pL)[:, None]
-    breakpoint()
-    return R
+    L = SimpleFixedLengthListener.from_strings(lang, init_p_L=init_p_L)
+    return L.R(epsilon=epsilon, strength=strength, epsilon_multiplier=epsilon_multiplier)
 
 # p(w | xyz) = p(w) p(w|x)/p(w) p(w|xy)/p(w|x) p(w|xyz)/p(w|xy)
 
@@ -518,6 +550,7 @@ def stutter_grid(eps=1/5, pad=2, **kwds):
     return grid(analyze_stutter_policy, R, **kwds)
 
 def grid(f, R, gamma_min=0, gamma_max=5, gamma_steps=100, alpha_min=0, alpha_max=1, alpha_steps=100, init_temperature=1000, num_iter=1000, **kwds):
+    """ f is a function taking a tensor of policies and returning a dictionary of tensors of statistics """
     alphas = np.linspace(alpha_max, alpha_min, alpha_steps)
     gammas = np.linspace(gamma_min, gamma_max, gamma_steps)
     T = R.ndim
@@ -547,8 +580,163 @@ def grid(f, R, gamma_min=0, gamma_max=5, gamma_steps=100, alpha_min=0, alpha_max
     for statistic_name, statistic_value in statistics.items():
         df[statistic_name] = einops.rearrange(statistic_value, "a g -> (a g)")
         
-
     return df
+
+def analyze_infolocality(**kwds):
+    # aa -> 000 or 110 -- 00/11 is a synergistic word which is local here
+    # ab -> 001 or 111
+    # ba -> 100 or 010
+    # bb -> 101 or 011
+    xor_lang_local = [ # local lang
+        ['0000', '1100'],
+        ['0011', '1111'],
+        ['1000', '0100'],
+        ['1011', '0111'],
+    ]
+    xor_lang_nonlocal = [ # nonlocal lang
+        ['0000', '1001'],
+        ['0110', '1111'],
+        ['1000', '0001'],
+        ['1110', '0111'],
+    ]
+
+
+    abc_lang = [
+        list(itertools.permutations("abc")),
+        list(itertools.permutations("abd")),
+        list(itertools.permutations("aec")),
+        list(itertools.permutations("aed")),
+        list(itertools.permutations("fbc")),
+        list(itertools.permutations("fbd")),
+        list(itertools.permutations("fec")),
+        list(itertools.permutations("fed")),        
+    ]
+
+    aan_lang = [
+        ['abc', 'bac'],
+        ['abd', 'bad'],
+        ['aec', 'eac'],
+        ['aed', 'ead'],
+        ['fbc', 'bfc'],
+        ['fbd', 'bfd'],
+        ['fec', 'efc'],
+        ['fed', 'efd'],        
+    ]
+
+    naa_lang = [
+        ['cab', 'cba'],
+        ['dab', 'dba'],
+        ['cae', 'cea'],
+        ['dae', 'dea'],
+        ['cfb', 'cbf'],
+        ['dfb', 'dbf'],
+        ['cfe', 'cef'],
+        ['dfe', 'def'],        
+    ]
+    
+    p_g = np.reshape((np.ones(2)/2)[:, None] * (np.array([3, 1, 1, 3])/8)[None, :], 8)
+    # no preference with alpha=1; with alpha-1/2, prefers orders:
+    # bca > bac > abc -- good, local preferred when positive pmi; only bad thing is bac > abc...
+    # bad > bda > adb -- good, nonlocal preferred when negative pmi
+    # but why does a want to go last? shouldn't it be neutral?
+
+    p = np.exp(integrate(policy(encode_simple_lang(naa_lang), p_g=p_g, **kwds)))
+    highmi_axx = p[0, 0, 1, 2] + p[0, 0, 2, 1]
+    highmi_xax = p[0, 1, 0, 2] + p[0, 2, 0, 1]
+    highmi_xxa = p[0, 1, 2, 0] + p[0, 2, 1, 0]
+    lowmi_axx = p[1, 0, 1, 3] + p[1, 0, 3, 1]
+    lowmi_xax = p[1, 1, 0, 3] + p[1, 3, 0, 1]
+    lowmi_xxa = p[1, 1, 3, 0] + p[1, 3, 1, 0]
+    return np.array([[highmi_axx, highmi_xax, highmi_xxa],
+                     [lowmi_axx, lowmi_xax, lowmi_xxa]])
+
+def compdrop_entropy_grid(**kwds):
+    def f(policies):
+        return {
+            'lnpcomp_high': policies[..., 0, EMPTY, 2, 1],
+            'lnpcomp_low': policies[..., 4, EMPTY, 3, 1],
+            'entropy_comp': policies[..., 0, EMPTY, 2, 1] - policies[..., 4, EMPTY, 3, 1], # positive means entropy -> more complementizers
+            'freq_comp': policies[..., 1, EMPTY, 2, 1] - policies[..., 0, EMPTY, 2, 1], # positive means more freq RC -> more 
+        }
+    R = compdrop_R(num_verbs=2, num_rcs=4, num_nouns=0)    
+    p_g = np.array([
+        1/2,1/6,1/6,1/6, # V1Ri, high entropy
+        1/2,1/2,0,0, # V2Ri, low entropy
+    ])
+    return grid(f, R, p_g=p_g, **kwds)
+
+def compdrop_compprob_grid(k=3, **kwds):
+    # never positive! if there is a correlation of complementizer dropping and p(complementizer|V), then it's not from this!
+    # negative correlation for gamma<1.
+    def f(policies):
+        return {
+            'lnpcomp_lf': policies[..., 0, EMPTY, 2, 1],
+            'pcomp_diff': policies[..., 0, EMPTY, 2, 1] - policies[..., 2, EMPTY, 3, 1],
+        }
+    R = compdrop_R(num_verbs=2,
+                   num_rcs=2,
+                   num_nouns=2)
+    p_g = np.array([ 
+        1,1, # V1Ri: RC probability 1/4
+        k,k, # V2Ri: RC probability 3/4 
+        k,k,   # V1N: noun probability 3/4
+        1,1,   # V2N: noun probability 1/4
+    ])
+    p_g = p_g / p_g.sum()
+    return grid(f, R, p_g=p_g, **kwds)
+
+def compdrop_R(num_verbs=1, num_nouns=1, num_rcs=1, **kwds):
+    # need a way to control strength of r, not c
+    # 0 = stop symbol
+    # 1 = that
+    # 2:2+num_verbs = verbs
+    # 2+num_verbs:2+num_verbs+num_rcs = rcs
+    # finally nouns
+    verbs = range(2, 2+num_verbs)
+    rcs = range(2+num_verbs, 2+num_verbs+num_rcs)
+    nouns = range(2+num_verbs+num_rcs, 2+num_verbs+num_rcs+num_nouns)
+
+    rc_sentences = list(itertools.product(verbs, rcs))
+    rc_c_sentences = [(v,1,r) for v,r in rc_sentences]
+    rc_null_sentences = [(v,r,0) for v,r in rc_sentences]
+    noun_sentences = [(v,n,0) for v,n in itertools.product(verbs, nouns)]
+    rc_utterances = list(zip(rc_c_sentences, rc_null_sentences))
+    noun_utterances = [(ns,) for ns in noun_sentences]
+
+    utterances = rc_utterances + noun_utterances
+
+    return encode_simple_lang(utterances, **kwds)
+
+def zipf_mandelbrot(N, s, q=0):
+    k = np.arange(N) + 1
+    p = 1/(k+q)**s
+    Z = p.sum()
+    return p / Z
+
+def classifier_lang(num_nouns=100, num_classifiers=2):
+    """ Language where every noun can go with a generic classifier, or
+    one of `num_classifiers` specific classifiers, evenly distributed. """
+    assert num_nouns % num_classifiers == 0
+    nouns_per_classifier = num_nouns // num_classifiers
+    classifiers = []
+    nouns = range(num_nouns)
+    for n in nouns:
+        classifiers.extend([n] * nouns_per_classifier)
+    lang = []
+    for classifier, n in zip(classifiers, nouns):
+        lang.append([('0C', 'N'+str(n)), ('C'+str(classifier), 'N'+str(n))])
+    random.shuffle(lang)
+    return lang
+
+def analyze_classifier_lang(num_nouns=100, num_classifiers=2, gamma=1, alpha=1, s=1, q=0, num_iter=1000, **kwds):
+    # does not show a simple frequency correlation. however,
+    # need to try case where p_L is noisy as a function of frequency
+    lang = classifier_lang(num_nouns=num_nouns, num_classifiers=num_classifiers)
+    probs = zipf_mandelbrot(num_nouns, s=s, q=q)
+    R = encode_simple_lang(lang, **kwds)
+    lnp = policy(R, p_g=probs, gamma=gamma, alpha=alpha, num_iter=num_iter)
+    default_probs = np.exp(lnp)[:, EMPTY, 0]
+    return default_probs
 
 def codability_R(eps=1/5):
     return encode_simple_lang(
@@ -690,7 +878,7 @@ def test_control_signal():
     ])
     p_g = np.array([.25, .75])
     lnp = scipy.special.log_softmax(p*100, -1)
-    lnp0 = passive_dynamics(p_g, lnp) 
+    lnp0 = automatic_policy(p_g, lnp) 
     # first try no future planning, then we should get u = R
     u = control_signal(R, lnp, lnp0, gamma=1, alpha=0)
     #assert is_close(u, R).all() # NANs!
@@ -809,7 +997,7 @@ def test_integrate_conditionalize():
         assert is_close(dp, dp2).all()
         assert is_close(p, p2).all()
 
-def test_passive_dynamics():
+def test_automatic_policy():
     p_g = np.array([.1, .9, 0])
     # active dynamics is 0 -> aa, 1 -> bb, 0 -> cc
     # passive dynamics should have p(a|00) = .1, p(b|00) = .9, p(c|00) = 0
@@ -828,7 +1016,7 @@ def test_passive_dynamics():
          [0, 0, 1],  # c_
          [0, 0, 1]], # 0_
     ]))
-    lnp0 = passive_dynamics(p_g, lnp).squeeze(0)
+    lnp0 = automatic_policy(p_g, lnp).squeeze(0)
     a, b, c = range(3)
     assert lnp0[a,a] == 0
     assert lnp0[EMPTY,a] == np.log(p_g[0])
@@ -873,7 +1061,7 @@ def test_passive_dynamics():
             ]
         ],        
     ])
-    p0 = np.exp(passive_dynamics(np.array([.25, .75]), np.log(p)).squeeze())
+    p0 = np.exp(automatic_policy(np.array([.25, .75]), np.log(p)).squeeze())
     assert p0[EMPTY,EMPTY,a] == 1/4
     assert p0[EMPTY,EMPTY,b] == 3/4
     assert p0[a,a,a] == 1
