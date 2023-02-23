@@ -50,7 +50,6 @@ def lm_entropy(tokenizer, model, prefix, complementizer="that", steps=STEPS):
         V = len(tokenizer)
         continuations = torch.arange(V).unsqueeze(-1)
         input = torch.cat([input.expand(V, N), continuations], -1)
-    breakpoint()
     probs = model(input).logits.log_softmax(-1)[..., -steps:, :].sum(-2) # shape V^steps
     H = -(probs.exp() * probs).sum()
     return H.item()
@@ -150,10 +149,10 @@ def compdrop_R(num_verbs=1, num_nouns=1, num_rcs=1, the=False, **kwds):
     return encode_simple_lang(lang, **kwds)
 
 def main():
-    #print("Generating grids...", file=sys.stderr)
-    #df = compdrop_entropy_grid(num_iter=NUM_ITER, gamma_max=GAMMA_MAX)
-    #df.to_csv("compdrop/compdrop_sims.csv")
-    #print("Done.", file=sys.stderr)    
+    print("Generating grids...", file=sys.stderr)
+    df = compdrop_entropy_grid(num_iter=NUM_ITER, gamma_max=GAMMA_MAX)
+    df.to_csv("compdrop/compdrop_sims.csv")
+    print("Done.", file=sys.stderr)    
 
     print("Loading data...", file=sys.stderr)
     data = pd.read_csv("compdrop/data.csv")
@@ -162,12 +161,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     model = AutoModelWithLMHead.from_pretrained("gpt2")
     
-    #print("Getting probabilities...", file=sys.stderr) 
-    #results = [
-    #    lm_probs(tokenizer, model, prefix, suffix)
-    #    for prefix, suffix in tqdm.tqdm(list(zip(data['prefix'], data['suffix'])))
-    #]
-    #data['lnp_suffix'], data['lnp_thatsuffix'], data['lnp_both'], data['lnp_comp'] = zip(*results)
+    print("Getting probabilities...", file=sys.stderr) 
+    results = [
+        lm_probs(tokenizer, model, prefix, suffix)
+        for prefix, suffix in tqdm.tqdm(list(zip(data['prefix'], data['suffix'])))
+    ]
+    data['lnp_suffix'], data['lnp_thatsuffix'], data['lnp_both'], data['lnp_comp'] = zip(*results)
     
     print("Getting entropy...", file=sys.stderr)
     entropy = [lm_entropy(tokenizer, model, prefix) for prefix in tqdm.tqdm(data['prefix'])]
