@@ -37,9 +37,7 @@ import tqdm
 import numpy as np
 import scipy.special
 import pandas as pd
-import opt_einsum
 import einops
-import rfutils
 
 INF = float('inf')
 EMPTY = -1
@@ -53,6 +51,19 @@ def the_unique(xs):
     for x in xs_it:
         assert x == first_value
     return first_value
+
+def buildup(iterable):
+    """ Build up
+
+    Example:
+    >>> list(buildup("abcd"))
+    [('a',), ('a', 'b'), ('a', 'b', 'c'), ('a', 'b', 'c', 'd')]
+
+    """
+    so_far = []
+    for x in iterable:
+        so_far.append(x)
+        yield tuple(so_far)
 
 def cartesian_indices(k, n):
     return itertools.product(*[range(k)]*n)
@@ -235,7 +246,7 @@ class SimpleFixedLengthListener:
         assoc = np.zeros((G,) + (V+1,)*(T-1) + (V,))
         for g, strings in enumerate(lang):
             for string in strings:
-                for prefix in rfutils.buildup(string):
+                for prefix in buildup(string):
                     S = len(prefix)
                     loc = (EMPTY,)*(T-S) + tuple(vocab[x] for x in prefix)
                     assoc[(g,) + loc] = 1
