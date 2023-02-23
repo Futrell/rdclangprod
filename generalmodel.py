@@ -1,4 +1,35 @@
+""" generalmodel
+
+Contains the general vectorized policy-iteration implementation of the RDC language production model,
+as well as a number of utility functions and code to reproduce the simulation experiments from Futrell (2023).
+
+Reward functions and policies are represented using a data structure called a prefix tensor.
+Suppose we want to represent probabilities of symbols given sequences of previous symbols,
+up to a fixed maximum length, for example the probability of "c" after "ab". Given a finite
+vocabulary "abc", the symbol "a" has index 0, "b" has index 1, and "c" has index 2. Then p(c|ab)
+is p[0,1,2]. The prefix tensor has a special index EMPTY (-1) so that p(b | a) is p[EMPTY,0,1].
+The probability p("abc") = p[EMPTY,EMPTY,0] * p[EMPTY,0,1] * p[0,1,2]. Therefore for a vocabulary
+of size V, and a maximum length of T, the shape of a prefix tensor is (V+1) x (V+1) x ... x (V+1) x V,
+with the (V+1) repeated T times.
+
+Prefix tensors can also have leading dimensions which allow indexing by goal or by batch. So a policy
+is represented as a prefix tensor G x (V+1) x ... x (V+1) x V, where the entries are log probabilities.
+
+The code includes some utility functions for dealing with log probability prefix tensors, such as
+integrate (which turns a prefix tensor where p[0,1,2] represents p(2 | 0,1) into one where
+p[0,1,2] represents p(0,1,2)), condionalize (the inverse of integrate), and marginalize, which
+takes a prefix tensor with a leading dimension and marginalizes over that dimension.
+
+Reward functions are also represented as prefix tensors. There are some utility functions to
+make it easier to generate reward functions for languages of interest. The class
+SimpleFixedLengthListener creates a reward tensor for a language defined using a list of
+lists of strings (for example, [['ab', 'ba'], ['cd', 'dc'], ['ef', 'fe']] corresponds to
+a language with three world states, each of which is expressible with one of two utterances
+ab or ba, cd or dc, ef or fe respectively).
+"""
+
 import sys
+import math
 import random
 import itertools
 
@@ -6,6 +37,7 @@ import tqdm
 import numpy as np
 import scipy.special
 import pandas as pd
+import opt_einsum
 import einops
 import rfutils
 
@@ -44,7 +76,7 @@ def shift_right(x, leading=0):
 def integrate(x, B=0):
     """ transform a prefix tensor lnp(x_t | x_{<t}) into lnp(x_{\le t}) """
     T = x.ndim - B - 1
-    y = x.copy()    
+    y = x.copy()
     for _, prev, curr in reversed(list(backward_iterator(T))):
         # y[0,0,a] = x[0,0,a]
         # y[0,a,b] = x[0,a,b] + x[0,0,a]       
@@ -78,18 +110,6 @@ def backward_iterator(T):
         cont_address = (...,) + (EMPTYSLICE,)*(t-1) + (NONEMPTY,)*(T-t) + (COLON,)
         yield t, curr_address, cont_address
 
-def stationary_policy(p_g, lnp, B=0):
-    # p(x) = \sum_{x_{\le t}} p(x_{\le t}) [x_{\le t} ends in x]
-    T = lnp.ndim - B - 1
-    joint = integrate(lnp, B=B) # lnp(x_{\le t} | g, t)
-    t = np.zeros_like(lnp)
-    for tau in range(T):
-        t[(COLON,) + (EMPTY,) * (T-tau) + (NONEMPTY,)*tau] = tau
-    
-    marginal = scipy.special.logsumexp(np.log(p_g[(...,) + (None,)*T]) + joint, B, keepdims=True) # ln p(x_{\le t} | t), 1xCx...xCxX
-    
-    mask = ...
-
 def automatic_policy(p_g, lnp, B=0):
     """ transform p(g) and ln p(x_t | g, x_{<t}) into ln p(x_t | x_{<t}) """
     joint = integrate(lnp, B=B) # ln p(x_{\le t} | g)
@@ -97,7 +117,7 @@ def automatic_policy(p_g, lnp, B=0):
     marginal = scipy.special.logsumexp(np.log(p_g[(...,) + (None,)*T]) + joint, B, keepdims=True) # ln p(x_{\le t} | t)
     return conditionalize(marginal, B=B)
 
-def value_to_go(lnp, local_value, alpha=1, B=0):
+def value(lnp, local_value, alpha=1, B=0):
     T = lnp.ndim - B - 1
     v = np.zeros_like(alpha) + local_value # trick to broadcast to correct shape and make a copy
     p = np.exp(lnp)
@@ -108,58 +128,50 @@ def value_to_go(lnp, local_value, alpha=1, B=0):
         v[curr] = v[curr] + alpha * shift_right(continuation_value, B + 1)
     return v
 
-def objective(R, lnp, gamma, alpha, p_g=None, B=0):
-    if p_g is None:
-        G = R.shape[B]
-        p_g = np.ones(G) / G
-    T = lnp.ndim - B - 1            
-    lnp0 = automatic_policy(p_g, lnp, B=B)
-    control_cost = lnp - lnp0
-    local_value = gamma * R - control_cost
-    v = value_to_go(lnp, local_value, alpha, B=B)
-    return (p_g[(...,) + (None,)*T] * v).sum()
+def control_signal(R, lnp, lnp0, gamma, alpha, delta=1, lmbda=1, B=0):
+    control_cost = (1/lmbda)*(lnp - lnp0)
+    local_value = gamma * R - delta * control_cost
+    v = value(lnp, local_value, alpha, B=B) # v = gamma*R - control_cost + alpha*v'
+    return v + control_cost # to get gamma*R + alpha*v'
 
-def control_signal(R, lnp, lnp0, gamma, alpha, B=0):
-    control_cost = lnp - lnp0
-    local_value = gamma*R - control_cost
-    v = value_to_go(lnp, local_value, alpha, B=B)
-    return v + control_cost
-
-def policy(R,
-           p_g=None,
-           gamma=1,
-           alpha=1,
-           num_iter=1000,
-           init_temperature=100,
-           B=0,
-           tie_init=True,
-           force_index=0,
-           force=0,
-           debug=False,           
-           monitor=False,
-           return_default=False):
+def policy(R,                    # reward tensor, shape G...X.
+           p_g=None,             # need distribution, shape batches x G, default uniform.
+           gamma=1,              # reward gain (alpha in the papers)
+           alpha=1,              # future discount (gamma in the papers)
+           lmbda=1,              # control signal gain
+           delta=1,              # cost gain (set to 0 for planning without cost)
+           num_iter=1000,        # number of policy iteration steps
+           init_temperature=100, # initial temperature for REM initialization
+           lnp0=None,            # if not specified, found by marginalization
+           B=0,                  # number of batch dimensions
+           tie_init=True,        # tie initialization across batches
+           debug=False,          # go into the debugger at each iteration
+           monitor=False,        # show a progress bar
+           return_default=False, # return the default policy lnp0 in addition to the policy lnp
+           ):
     # R_g : a tensor G x C ... C x X with conditional rewards
     assert B >= 0
     if p_g is None:
         G = R.shape[B]
         p_g = np.ones(G) / G
 
-    # Initialize with potential forced initial condition
     if not tie_init:
         a, g, *_ = np.broadcast_arrays(alpha, gamma)[0].shape
         R = einops.repeat(R, "1 1 ... -> a g ...", a=a, g=g)
     init = 1/init_temperature * np.random.randn(*R.shape)
-    init[..., force_index] += force
     lnp = scipy.special.log_softmax(init, -1)
+
+    fit_lnp0 = lnp0 is None
 
     # Policy iteration
     iterations = tqdm.tqdm(range(num_iter)) if monitor else range(num_iter)
     for i in iterations:
-        lnp0 = automatic_policy(p_g, lnp, B=B)
-        u = control_signal(R, lnp, lnp0, gamma, alpha, B=B)
+        if fit_lnp0:
+            lnp0 = automatic_policy(p_g, lnp, B=B)
+        u = control_signal(R, lnp, lnp0, gamma, alpha, lmbda=lmbda, delta=delta, B=B)
         if debug:
             breakpoint()
-        lnp = scipy.special.log_softmax(lnp0 + u, -1)
+        lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
 
     if return_default:
         return lnp, lnp0
@@ -199,24 +211,6 @@ def fp_R(R, value=0):
         new_R[(COLON,) + context + (slice(1, None, None),)] = R[(COLON,) + old_context + (COLON,)]
     return new_R
     
-def stop_R(R):
-    """ add absorbing action at index 0 everywhere with value 0
-    and everything has value 0 after the absorbing action.
-
-    input is G x C ... C x X
-    output is G x (C+1) ... (C+1) x (X+1)
-    """
-    G, *rest = R.shape
-    T = len(rest)
-    # add # to the vocabulary
-    # previously like (-1,0)->1, (-1,1)->2, ..., (0,0)->3, etc.
-    # now like        (-1,0)->0, (-1,1)->1, (-1,2)->2, ...,
-    # basically anything with an index 0 will have value 0, otherwise things are the same
-    new_R = np.zeros((G,) + tuple(x+1 for x in rest)) 
-    # fill in old values where appropriate
-    new_R[(COLON,) + (slice(1,None,None),)*T] = R
-    return new_R
-
 class SimpleFixedLengthListener:
     def __init__(self, assoc, init_p_L=None):
         self.assoc = assoc
@@ -507,7 +501,6 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
     })
 
     dfm = pd.melt(df, id_vars=['DR'])
-
     return df, policy_df
 
 def uneven_listener(V, epsilon=1/5, weight=1):
@@ -517,7 +510,6 @@ def uneven_listener(V, epsilon=1/5, weight=1):
                               epsilon=epsilon,
                               epsilon_multiplier=1/(np.arange(V)+1)*weight)
         
-
 def shortlong_grid(eps=1/5, offset=0, **kwds):
     def shortlong_pref(policies):
         p_short = np.exp(policies[:, :, 0, EMPTY, EMPTY, 0])
@@ -581,162 +573,6 @@ def grid(f, R, gamma_min=0, gamma_max=5, gamma_steps=100, alpha_min=0, alpha_max
         df[statistic_name] = einops.rearrange(statistic_value, "a g -> (a g)")
         
     return df
-
-def analyze_infolocality(**kwds):
-    # aa -> 000 or 110 -- 00/11 is a synergistic word which is local here
-    # ab -> 001 or 111
-    # ba -> 100 or 010
-    # bb -> 101 or 011
-    xor_lang_local = [ # local lang
-        ['0000', '1100'],
-        ['0011', '1111'],
-        ['1000', '0100'],
-        ['1011', '0111'],
-    ]
-    xor_lang_nonlocal = [ # nonlocal lang
-        ['0000', '1001'],
-        ['0110', '1111'],
-        ['1000', '0001'],
-        ['1110', '0111'],
-    ]
-
-
-    abc_lang = [
-        list(itertools.permutations("abc")),
-        list(itertools.permutations("abd")),
-        list(itertools.permutations("aec")),
-        list(itertools.permutations("aed")),
-        list(itertools.permutations("fbc")),
-        list(itertools.permutations("fbd")),
-        list(itertools.permutations("fec")),
-        list(itertools.permutations("fed")),        
-    ]
-
-    aan_lang = [
-        ['abc', 'bac'],
-        ['abd', 'bad'],
-        ['aec', 'eac'],
-        ['aed', 'ead'],
-        ['fbc', 'bfc'],
-        ['fbd', 'bfd'],
-        ['fec', 'efc'],
-        ['fed', 'efd'],        
-    ]
-
-    naa_lang = [
-        ['cab', 'cba'],
-        ['dab', 'dba'],
-        ['cae', 'cea'],
-        ['dae', 'dea'],
-        ['cfb', 'cbf'],
-        ['dfb', 'dbf'],
-        ['cfe', 'cef'],
-        ['dfe', 'def'],        
-    ]
-    
-    p_g = np.reshape((np.ones(2)/2)[:, None] * (np.array([3, 1, 1, 3])/8)[None, :], 8)
-    # no preference with alpha=1; with alpha-1/2, prefers orders:
-    # bca > bac > abc -- good, local preferred when positive pmi; only bad thing is bac > abc...
-    # bad > bda > adb -- good, nonlocal preferred when negative pmi
-    # but why does a want to go last? shouldn't it be neutral?
-
-    p = np.exp(integrate(policy(encode_simple_lang(naa_lang), p_g=p_g, **kwds)))
-    highmi_axx = p[0, 0, 1, 2] + p[0, 0, 2, 1]
-    highmi_xax = p[0, 1, 0, 2] + p[0, 2, 0, 1]
-    highmi_xxa = p[0, 1, 2, 0] + p[0, 2, 1, 0]
-    lowmi_axx = p[1, 0, 1, 3] + p[1, 0, 3, 1]
-    lowmi_xax = p[1, 1, 0, 3] + p[1, 3, 0, 1]
-    lowmi_xxa = p[1, 1, 3, 0] + p[1, 3, 1, 0]
-    return np.array([[highmi_axx, highmi_xax, highmi_xxa],
-                     [lowmi_axx, lowmi_xax, lowmi_xxa]])
-
-def compdrop_entropy_grid(**kwds):
-    def f(policies):
-        return {
-            'lnpcomp_high': policies[..., 0, EMPTY, 2, 1],
-            'lnpcomp_low': policies[..., 4, EMPTY, 3, 1],
-            'entropy_comp': policies[..., 0, EMPTY, 2, 1] - policies[..., 4, EMPTY, 3, 1], # positive means entropy -> more complementizers
-            'freq_comp': policies[..., 1, EMPTY, 2, 1] - policies[..., 0, EMPTY, 2, 1], # positive means more freq RC -> more 
-        }
-    R = compdrop_R(num_verbs=2, num_rcs=4, num_nouns=0)    
-    p_g = np.array([
-        1/2,1/6,1/6,1/6, # V1Ri, high entropy
-        1/2,1/2,0,0, # V2Ri, low entropy
-    ])
-    return grid(f, R, p_g=p_g, **kwds)
-
-def compdrop_compprob_grid(k=3, **kwds):
-    # never positive! if there is a correlation of complementizer dropping and p(complementizer|V), then it's not from this!
-    # negative correlation for gamma<1.
-    def f(policies):
-        return {
-            'lnpcomp_lf': policies[..., 0, EMPTY, 2, 1],
-            'pcomp_diff': policies[..., 0, EMPTY, 2, 1] - policies[..., 2, EMPTY, 3, 1],
-        }
-    R = compdrop_R(num_verbs=2,
-                   num_rcs=2,
-                   num_nouns=2)
-    p_g = np.array([ 
-        1,1, # V1Ri: RC probability 1/4
-        k,k, # V2Ri: RC probability 3/4 
-        k,k,   # V1N: noun probability 3/4
-        1,1,   # V2N: noun probability 1/4
-    ])
-    p_g = p_g / p_g.sum()
-    return grid(f, R, p_g=p_g, **kwds)
-
-def compdrop_R(num_verbs=1, num_nouns=1, num_rcs=1, **kwds):
-    # need a way to control strength of r, not c
-    # 0 = stop symbol
-    # 1 = that
-    # 2:2+num_verbs = verbs
-    # 2+num_verbs:2+num_verbs+num_rcs = rcs
-    # finally nouns
-    verbs = range(2, 2+num_verbs)
-    rcs = range(2+num_verbs, 2+num_verbs+num_rcs)
-    nouns = range(2+num_verbs+num_rcs, 2+num_verbs+num_rcs+num_nouns)
-
-    rc_sentences = list(itertools.product(verbs, rcs))
-    rc_c_sentences = [(v,1,r) for v,r in rc_sentences]
-    rc_null_sentences = [(v,r,0) for v,r in rc_sentences]
-    noun_sentences = [(v,n,0) for v,n in itertools.product(verbs, nouns)]
-    rc_utterances = list(zip(rc_c_sentences, rc_null_sentences))
-    noun_utterances = [(ns,) for ns in noun_sentences]
-
-    utterances = rc_utterances + noun_utterances
-
-    return encode_simple_lang(utterances, **kwds)
-
-def zipf_mandelbrot(N, s, q=0):
-    k = np.arange(N) + 1
-    p = 1/(k+q)**s
-    Z = p.sum()
-    return p / Z
-
-def classifier_lang(num_nouns=100, num_classifiers=2):
-    """ Language where every noun can go with a generic classifier, or
-    one of `num_classifiers` specific classifiers, evenly distributed. """
-    assert num_nouns % num_classifiers == 0
-    nouns_per_classifier = num_nouns // num_classifiers
-    classifiers = []
-    nouns = range(num_nouns)
-    for n in nouns:
-        classifiers.extend([n] * nouns_per_classifier)
-    lang = []
-    for classifier, n in zip(classifiers, nouns):
-        lang.append([('0C', 'N'+str(n)), ('C'+str(classifier), 'N'+str(n))])
-    random.shuffle(lang)
-    return lang
-
-def analyze_classifier_lang(num_nouns=100, num_classifiers=2, gamma=1, alpha=1, s=1, q=0, num_iter=1000, **kwds):
-    # does not show a simple frequency correlation. however,
-    # need to try case where p_L is noisy as a function of frequency
-    lang = classifier_lang(num_nouns=num_nouns, num_classifiers=num_classifiers)
-    probs = zipf_mandelbrot(num_nouns, s=s, q=q)
-    R = encode_simple_lang(lang, **kwds)
-    lnp = policy(R, p_g=probs, gamma=gamma, alpha=alpha, num_iter=num_iter)
-    default_probs = np.exp(lnp)[:, EMPTY, 0]
-    return default_probs
 
 def codability_R(eps=1/5):
     return encode_simple_lang(
@@ -889,7 +725,7 @@ def test_control_signal():
     assert u[1, EMPTY, 1, 0] == 1    
     assert u[1, EMPTY, EMPTY, 1] == 1    
         
-def test_value_to_go():
+def test_value():
     # example local value tensor for...
     # aa -> 1+10
     # ab -> 1+20
@@ -903,7 +739,7 @@ def test_value_to_go():
         [100, 200],
         [1, 2],
     ]]).astype(float)
-    assert (value_to_go(np.zeros(l.shape), l, 1)
+    assert (value(np.zeros(l.shape), l, 1)
             == np.array([[[10, 20], [100, 200], [31, 302]]])).all()
 
     # aaa -> 1+10+100
@@ -929,7 +765,7 @@ def test_value_to_go():
         ]
     ]]).astype(float)
     a, b = range(2)
-    result = value_to_go(np.zeros(l.shape), l, 1)
+    result = value(np.zeros(l.shape), l, 1)
     assert result[0, EMPTY, EMPTY, a] == 631
     assert result[0, EMPTY, EMPTY, b] == 632
     assert result[0, EMPTY, a, a] == 310
@@ -1080,45 +916,6 @@ def test_add_corr():
         [-20.,   3.,   4.],
         [  0.,  10.,  20.] # R(c|0)=0
     ]])).all()
-
-def t_e_s_t_stop_R():
-    # start with aa,ab,ba,bb
-    R = np.array([[
-        [1, 2],
-        [3, 4],
-        [10, 20],
-    ]])
-    new_R = stop_R(R, T=0)
-    assert (new_R == np.array([[
-        [ 0., -INF, -INF],  # #_    after # can only continue with #
-        [ 0.,  1.,  2.],    # a_    after a, probably continue with b
-        [ 0.,  3.,  4.],    # b_    after b, probably continue with b
-        [ 0., 10., 20.]     # 0_    after EMPTY, probably continue with b
-    ]])).all()
-
-    new_R = stop_R(R, T=1)
-    assert (new_R == np.array([[
-        [[ 0., -INF, -INF],  # ##_
-          [ 0.,  0.,  0.],   # junk etc.
-          [ 0.,  0.,  0.],
-          [ 0.,  0.,  0.]],
-
-         [[ 0., -INF, -INF],  # a#_
-          [ 0.,  0.,  0.],    # aa_
-          [ 0.,  0.,  0.],
-          [ 0.,  0.,  0.]],
-
-         [[ 0., -INF, -INF],
-          [ 0.,  0.,  0.],
-          [ 0.,  0.,  0.],
-          [ 0.,  0.,  0.]],
-
-         [[ 0., -INF, -INF],
-          [ 0.,  1.,  2.],
-          [ 0.,  3.,  4.],
-          [ 0., 10., 20.]]
-    ]])).all()
-
 
 def figures():
     # short before long
