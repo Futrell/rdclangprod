@@ -143,7 +143,7 @@ def control_signal(R, lnp, lnp0, gamma, alpha, delta=1, lmbda=1, B=0):
     control_cost = (1/lmbda)*(lnp - lnp0)
     local_value = gamma * R - delta * control_cost
     v = value(lnp, local_value, alpha, B=B) # v = gamma*R - control_cost + alpha*v'
-    return v + control_cost # to get gamma*R + alpha*v'
+    return v + delta * control_cost # to get gamma*R + alpha*v'
 
 def policy(R,                    # reward tensor, shape G...X.
            p_g=None,             # need distribution, shape batches x G, default uniform.
@@ -604,6 +604,9 @@ def shortlong_R(eps=1/5):
         ],
         epsilon=eps
     )
+
+def entropy(x, axis=-1):
+    return -scipy.special.xlogy(np.exp(x), x).sum(axis=axis)
 
 def test_control_signal():
     # g1 -> aa
