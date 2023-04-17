@@ -1,7 +1,6 @@
 """ generalmodel
 
-Contains the general vectorized policy-iteration implementation of the RDC language production model,
-as well as a number of utility functions and code to reproduce the simulation experiments from Futrell (2023).
+Contains the general vectorized policy-iteration implementation of the RDC language production model.
 
 Reward functions and policies are represented using a data structure called a prefix tensor.
 Suppose we want to represent probabilities of symbols given sequences of previous symbols,
@@ -16,8 +15,8 @@ Prefix tensors can also have leading dimensions which allow indexing by goal or 
 is represented as a prefix tensor G x (V+1) x ... x (V+1) x V, where the entries are log probabilities.
 
 The code includes some utility functions for dealing with log probability prefix tensors, such as
-integrate (which turns a prefix tensor where p[0,1,2] represents p(2 | 0,1) into one where
-p[0,1,2] represents p(0,1,2)), condionalize (the inverse of integrate), and marginalize, which
+integrate (which turns a prefix tensor where p[0,1,2] representing p(2 | 0,1) into one where
+p[0,1,2] represents p(0,1,2)), conditionalize (the inverse of integrate), and marginalize, which
 takes a prefix tensor with a leading dimension and marginalizes over that dimension.
 
 Reward functions are also represented as prefix tensors. There are some utility functions to
@@ -44,6 +43,8 @@ EMPTY = -1
 EMPTYSLICE = slice(-1, None, None)
 NONEMPTY = slice(None, -1, None)
 COLON = slice(None, None, None)
+
+TOL = 10 ** -5
 
 def the_unique(xs):
     xs_it = iter(xs)
@@ -112,6 +113,16 @@ def conditionalize(x, B=0):
     return y
 
 def backward_iterator(T):
+    """ Give indices to iterate backwards through a prefix tensor.
+
+    For example, for sequences xyz, yield addresses:
+       curr=0xy, cont=xyz
+       curr=00y, cont=0xy
+
+    Note that indices for curr=000,cont=00x are never yielded, because curr=000 is not
+    represented within a prefix tensor.
+    
+    """
     for t in range(1, T):
         # current address is 00c,x  ... ex. initially with X=2 and T=3 and t=2, 00,x  -- 1x1x2
         # continuation is    0cx,y      ex. initially with X=2 and T=3 and t=2, 0x,Y  -- 1x2x2
@@ -128,67 +139,195 @@ def automatic_policy(p_g, lnp, B=0):
     marginal = scipy.special.logsumexp(np.log(p_g[(...,) + (None,)*T]) + joint, B, keepdims=True) # ln p(x_{\le t} | t)
     return conditionalize(marginal, B=B)
 
-def value(lnp, local_value, alpha=1, B=0):
+def value(lnp, local_value, discount=1, B=0):
+    """ One pass of value iteration, starting with the later actions and going backward. """
     T = lnp.ndim - B - 1
-    v = np.zeros_like(alpha) + local_value # trick to broadcast to correct shape and make a copy
+    v = np.zeros_like(discount) + local_value # trick to broadcast to correct shape and make a copy
     p = np.exp(lnp)
     for _, curr, cont in backward_iterator(T):
         # v[a,b,c] = l[a,b,c]
-        # v[0,a,b] = l[0,a,b] + alpha * v[a,b,:].sum(-1)
+        # v[0,a,b] = l[0,a,b] + discount * v[a,b,:].sum(-1)
         continuation_value = (p[cont] * v[cont]).sum(-1, keepdims=True)
-        v[curr] = v[curr] + alpha * shift_right(continuation_value, B + 1)
+        v[curr] = v[curr] + discount * shift_right(continuation_value, B + 1)
     return v
 
-def control_signal(R, lnp, lnp0, gamma, alpha, delta=1, lmbda=1, B=0):
+def control_signal(R, lnp, lnp0, gain, discount, costgain=1, lmbda=1, B=0):
     control_cost = (1/lmbda)*(lnp - lnp0)
-    local_value = gamma * R - delta * control_cost
-    v = value(lnp, local_value, alpha, B=B) # v = gamma*R - control_cost + alpha*v'
-    return v + delta * control_cost # to get gamma*R + alpha*v'
+    local_value = gain * R - costgain * control_cost
+    v = value(lnp, local_value, discount, B=B) # v = gain*R - control_cost + discount*v'
+    return v + costgain * control_cost # u = gain*R + discount*v' = v + control_cost
 
-def policy(R,                    # reward tensor, shape G...X.
-           p_g=None,             # need distribution, shape batches x G, default uniform.
-           gamma=1,              # reward gain (alpha in the papers)
-           alpha=1,              # future discount (gamma in the papers)
-           lmbda=1,              # control signal gain
-           delta=1,              # cost gain (set to 0 for planning without cost)
-           num_iter=1000,        # number of policy iteration steps
-           init_temperature=100, # initial temperature for REM initialization
-           lnp0=None,            # if not specified, found by marginalization
-           B=0,                  # number of batch dimensions
-           tie_init=True,        # tie initialization across batches
-           debug=False,          # go into the debugger at each iteration
-           monitor=False,        # show a progress bar
-           return_default=False, # return the default policy lnp0 in addition to the policy lnp
-           ):
-    # R_g : a tensor G x C ... C x X with conditional rewards
+def z_iteration(R,
+                p_g=None,
+                gain=1,
+                discount=1,
+                init_temperature=100,
+                lnp0=None,
+                tie_init=True,
+                num_iter=1000,
+                B=0,
+                debug=False,
+                monitor=False,
+                return_default=False,
+                ba_steps=1,
+                init_lnp=None,
+                tol=TOL,
+                print_loss=False):
+    """ Solve for RDC policy using InfoRL algorithm from Rubin et al. (2012),
+    a variant of z-iteration from Todorov (2009), interlaced with Blahut-Arimoto. """
+    assert B >= 0
+    T = R.ndim - 1
+    G = R.shape[B]
+    if p_g is None:
+        p_g = np.ones(G) / G
+    fit_lnp0 = lnp0 is None        
+
+    if not tie_init:
+        a, g, *_ = np.broadcast_arrays(discount, gain)[0].shape
+        R = einops.repeat(R, "1 1 ... -> a g ...", a=a, g=g)
+
+    if init_lnp is None:
+        init = 1/init_temperature * np.random.randn(*R.shape).mean(B, keepdims=True).repeat(G, axis=B)
+        lnp = scipy.special.log_softmax(init, -1)
+    else:
+        lnp = init_lnp
+        
+    F = np.zeros(R.shape)
+    iterations = tqdm.tqdm(range(num_iter)) if monitor else range(num_iter)
+    for i in iterations:
+        old_lnp = lnp.copy()
+        if fit_lnp0:
+            lnp0 = automatic_policy(p_g, lnp, B=B)
+        old_F = F.copy()
+        for t, prev, curr in backward_iterator(T):
+            energy = lnp0[curr] + gain*R[curr] + discount*old_F[curr]
+            lnZ = scipy.special.logsumexp(energy, -1, keepdims=True)
+            F[prev] = shift_right(lnZ, B + 1)
+        if print_loss:
+            if T == 1:
+                print((p_g @ scipy.special.logsumexp(lnp0 + gain*R + discount*F, -1)).item())
+            else:
+                print((p_g @ scipy.special.logsumexp(lnp0 + gain*R + discount*F, -1)[:, (EMPTY,)*(T-1)]).item())
+        lnp = scipy.special.log_softmax(lnp0 + gain*R + discount*F, -1)
+        
+        # Check convergence
+        diff = np.sum(np.abs(old_F - F))
+        if diff < tol:
+            break
+
+    if debug: breakpoint()
+    if return_default:
+        return lnp, lnp0
+    else:
+        return lnp
+
+def policy_iteration(R,                    
+                     p_g=None,             
+                     gain=1,              
+                     discount=1,              
+                     lmbda=1,              
+                     costgain=1,           
+                     num_iter=1000,
+                     tol=TOL,
+                     init_temperature=100, 
+                     lnp0=None,
+                     init_lnp=None,
+                     B=0,
+                     extra_ba_steps=0,
+                     extra_pi_steps=0,
+                     tie_init=True,        
+                     debug=False,          
+                     monitor=False,        
+                     return_default=False,
+                     print_loss=False,
+                     ):
+    """ Compute RDC policy by Blahut-Arimoto policy iteration.
+
+    Inputs:
+    
+    R: A tensor of shape GC*X where R[g,c1,...,cn,x] is the reward for action x given context c1,...,cn with goal g.
+    p_g: A need distribution over goals, shape B*G where B is a batch dimension and G is goals.
+    gain: Control gain.
+    discount: Discount rate.
+    lmbda: Inverse penalty for control information.
+    costgain: Relative importance of cost in future planning calculation. Set to 0 to constrain information rate.
+    num_iter: Maximum number of policy iteration steps.
+    tol: If not None, the sum-squared-error convergence criterion.    
+    init_temperature: Temperature for random energy initialization.
+    lnp0: If specified, a fixed automatic policy.
+    B: Number of batch dimensions, default 0.
+    tie_init: If true, then all batches start with the same initialization.
+    debug: If true, go into the debugger at each iteration.
+    monitor: If true, show a progress bar.
+    return_default: If true, return the default policy lnp0 in addition to the controlled policy lnp.
+
+    """
     assert B >= 0
     if p_g is None:
         G = R.shape[B]
         p_g = np.ones(G) / G
 
     if not tie_init:
-        a, g, *_ = np.broadcast_arrays(alpha, gamma)[0].shape
+        a, g, *_ = np.broadcast_arrays(discount, gain)[0].shape
         R = einops.repeat(R, "1 1 ... -> a g ...", a=a, g=g)
-    init = 1/init_temperature * np.random.randn(*R.shape)
-    lnp = scipy.special.log_softmax(init, -1)
 
-    fit_lnp0 = lnp0 is None
+    T = R.ndim - B - 1
+    fit_lnp0 = lnp0 is None    
+
+    # initialization not dependent on goal, so control cost at init = 0
+    if init_lnp is None:
+        init = 1/init_temperature * np.random.randn(*R.shape).mean(B, keepdims=True)
+        lnp = scipy.special.log_softmax(init, -1)
+    else:
+        lnp = init_lnp
+
 
     # Policy iteration
     iterations = tqdm.tqdm(range(num_iter)) if monitor else range(num_iter)
     for i in iterations:
+        old_lnp = lnp.copy()
         if fit_lnp0:
             lnp0 = automatic_policy(p_g, lnp, B=B)
-        u = control_signal(R, lnp, lnp0, gamma, alpha, lmbda=lmbda, delta=delta, B=B)
-        if debug:
-            breakpoint()
-        lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
 
+        u = control_signal(R, lnp, lnp0, gain, discount, lmbda=lmbda, costgain=costgain, B=B)
+        
+        if print_loss:
+            if T == 1:
+                print((p_g @ scipy.special.logsumexp(lnp0 + lmbda*u, -1)).item())
+            else:
+                print((p_g @ scipy.special.logsumexp(lnp0 + lmbda*u, -1)[:, (EMPTY,)*(T-1)]).item())
+        
+        lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
+        for k in range(extra_pi_steps):
+            u = control_signal(R, lnp, lnp0, gain, discount, lmbda=lmbda, costgain=costgain, B=B)
+            lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
+        if fit_lnp0:
+            for k in range(extra_ba_steps):
+                lnp0 = automatic_policy(p_g, lnp, B=B)
+                lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
+
+        # Check convergence
+        diff = np.sum(np.abs(np.exp(lnp) - np.exp(old_lnp)))
+        if diff < tol:
+            break
+
+    if debug: breakpoint()
+    
     if return_default:
         return lnp, lnp0
     else:
         return lnp
 
+def loss_u(R, lnp, gain, discount, p_g=None, lmbda=1):
+    T = R.ndim - 1
+    if p_g is None:
+        G = R.shape[0]
+        p_g = np.ones(G)/G
+    lnp0 = automatic_policy(p_g, lnp)
+    u = control_signal(R, lnp, lnp0, gain, discount, lmbda=lmbda)
+    return p_g @ (scipy.special.logsumexp(lnp0 + lmbda*u, -1))[:, (EMPTY,)*(T-1)]
+
+    
 def pad_R(R, T=1):
     """ extend an R tensor by length T with no stop action """
     assert T >= 0
@@ -283,8 +422,6 @@ def encode_simple_lang(lang,
     """
     L = SimpleFixedLengthListener.from_strings(lang, init_p_L=init_p_L)
     return L.R(epsilon=epsilon, strength=strength, epsilon_multiplier=epsilon_multiplier)
-
-# p(w | xyz) = p(w) p(w|x)/p(w) p(w|xy)/p(w|x) p(w|xyz)/p(w|xy)
 
 def add_corr(R, corr_value=0):
     """ add correction action ! at index 0 which cancels all previous actions.
@@ -480,21 +617,19 @@ def ab_R(good=1, bad=-1):
     ])
     return np.ones_like(R)*bad + R*(good-bad)
 
-def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
-    R = uneven_listener(V, epsilon=epsilon, weight=weight)
+def fp_figures(V=5, epsilon=1/5, weight=1, gain=1.5, discount=1, method=policy_iteration, offset=0, which='distractors', **kwds):
+    R = uneven_listener(V, epsilon=epsilon, weight=weight, which=which)
     R_diag = np.diag(R)
     R_offdiag = (R - np.eye(V)*R_diag).sum(-1) / (V-1)
     DR = R_diag - R_offdiag
-    
-    R_padded = fp_R(pad_R(R, T=1), value=0)    
-    lnp, lnp0 = policy(R_padded,
-                       gamma=gamma,
-                       alpha=alpha,
+
+    R_padded = fp_R(pad_R(R, T=1), value=0) + offset
+    lnp, lnp0 = method(R_padded,
+                       gain=gain,
+                       discount=discount,
                        return_default=True,
                        monitor=True,
-                       init_temperature=100,
-                       num_iter=1000)
-
+                       **kwds)
     policy_df = pd.DataFrame({
         'g': np.repeat(range(V), V+1) + 1,
         'x': np.tile(range(V+1), V),
@@ -512,14 +647,48 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gamma=1.5, alpha=1):
     })
 
     dfm = pd.melt(df, id_vars=['DR'])
-    return df, policy_df
+    return df, policy_df, lnp, lnp0, R_padded
 
-def uneven_listener(V, epsilon=1/5, weight=1):
+def fp_listener(V, epsilon=1/5, weight=1, which='distractors'):
+    lang = [
+        [(v+1,0),
+         (0,v+1)]
+        for v in range(V)
+    ]
+    if which == 'distractors':
+        return encode_simple_lang(lang,
+                                  epsilon=epsilon,
+                                  epsilon_multiplier=1/((np.arange(V)+1)*weight))
+    elif which == 'target':
+        return encode_simple_lang(lang,
+                                  epsilon=epsilon,
+                                  strength=weight * (np.arange(V)+1))
+    elif which == 'both':
+        return encode_simple_lang(lang,
+                                  epsilon=epsilon,
+                                  epsilon_multiplier=1/((np.arange(V)+1*weight)),
+                                  strength=weight*(np.arange(V)+1))
+    elif which == 'neither':
+        return encode_simple_lang(lang, epsilon=epsilon)
+
+def uneven_listener(V, epsilon=1/5, weight=1, which='distractors'):
+    assert V <= 10
     # p(w | x) \propto \epsilon + [L(x) = w]
-    # good with V=5, epsilon=.2, gamma=2, alpha=1
-    return encode_simple_lang(list(map(list, map(str, range(V)))),
-                              epsilon=epsilon,
-                              epsilon_multiplier=1/(np.arange(V)+1)*weight)
+    if which == 'distractors':
+        return encode_simple_lang(list(map(list, map(str, range(V)))),
+                                  epsilon=epsilon,
+                                  epsilon_multiplier=1/((np.arange(V)+1)*weight))
+    elif which == 'target':
+        return encode_simple_lang(list(map(list, map(str, range(V)))),
+                                  epsilon=epsilon,
+                                  strength=weight * (np.arange(V)+1))
+    elif which == 'both':
+        return encode_simple_lang(list(map(list, map(str, range(V)))),
+                                  epsilon=epsilon,
+                                  strength=weight * (np.arange(V)+1),
+                                  epsilon_multiplier=1/((np.arange(V)+1)*weight))
+        
+        
         
 def shortlong_grid(eps=1/5, offset=0, **kwds):
     def shortlong_pref(policies):
@@ -552,31 +721,30 @@ def stutter_grid(eps=1/5, pad=2, **kwds):
     R = add_corr(pad_R(ab_listener_R(eps=eps), T=pad))
     return grid(analyze_stutter_policy, R, **kwds)
 
-def grid(f, R, gamma_min=0, gamma_max=5, gamma_steps=100, alpha_min=0, alpha_max=1, alpha_steps=100, init_temperature=1000, num_iter=1000, **kwds):
+def grid(f, R, gain_min=0, gain_max=5, gain_steps=100, discount_min=0, discount_max=1, discount_steps=100, init_temperature=1000, method=policy_iteration, **kwds):
     """ f is a function taking a tensor of policies and returning a dictionary of tensors of statistics """
-    alphas = np.linspace(alpha_max, alpha_min, alpha_steps)
-    gammas = np.linspace(gamma_min, gamma_max, gamma_steps)
+    discounts = np.linspace(discount_max, discount_min, discount_steps)
+    gains = np.linspace(gain_min, gain_max, gain_steps)
     T = R.ndim
     R = R[(None, None) + (COLON,)*T]
-    alphas = alphas[(COLON,) + (None,) + (None,)*T]
-    gammas = gammas[(None,) + (COLON,) + (None,)*T]    
-    policies = policy(
+    discounts = discounts[(COLON,) + (None,) + (None,)*T]
+    gains = gains[(None,) + (COLON,) + (None,)*T]    
+    policies = method(
         R,
-        gamma=gammas,
-        alpha=alphas,
+        gain=gains,
+        discount=discounts,
         B=2,
         init_temperature=init_temperature,
-        num_iter=num_iter,
         monitor=True,
         **kwds
     )
 
-    alpha_expanded = einops.repeat(alphas.squeeze(), "a -> a g", g=gamma_steps)
-    gamma_expanded = einops.repeat(gammas.squeeze(), "g -> a g", a=alpha_steps)
+    discount_expanded = einops.repeat(discounts.squeeze(), "a -> a g", g=gain_steps)
+    gain_expanded = einops.repeat(gains.squeeze(), "g -> a g", a=discount_steps)
 
     df = pd.DataFrame({
-        'alpha': einops.rearrange(alpha_expanded, "a g -> (a g)"),
-        'gamma': einops.rearrange(gamma_expanded, "a g -> (a g)"),
+        'discount': einops.rearrange(discount_expanded, "a g -> (a g)"),
+        'gain': einops.rearrange(gain_expanded, "a g -> (a g)"),
     })
 
     statistics = f(policies)    
@@ -589,7 +757,9 @@ def codability_R(eps=1/5):
     return encode_simple_lang(
         [
             ['ab', 'ac', 'ba', 'ca'],
-            ['aa', 'bb', 'cc'],
+            ['aa'],
+            ['bb'],
+            ['cc'],
         ],
         epsilon=eps,
     )
@@ -606,7 +776,8 @@ def shortlong_R(eps=1/5):
     )
 
 def entropy(x, axis=-1):
-    return -scipy.special.xlogy(np.exp(x), x).sum(axis=axis)
+    p = np.exp(x)
+    return -scipy.special.xlogy(p, p).sum(axis=axis)
 
 def test_control_signal():
     # g1 -> aa
@@ -635,10 +806,10 @@ def test_control_signal():
     ))
 
     # first try no future planning, then we should get u = R.
-    u = control_signal(R, lnp, lnp0, gamma=1, alpha=0)
+    u = control_signal(R, lnp, lnp0, gain=1, discount=0)
     assert is_close(u, R).all()
 
-    u = control_signal(R, lnp, lnp0, gamma=1, alpha=1)    
+    u = control_signal(R, lnp, lnp0, gain=1, discount=1)    
     # check u(x_2 | g, x_1)
     assert is_close(u[0, 0, 0], 1)
     assert is_close(u[1, 0, 1], 1)
@@ -730,10 +901,10 @@ def test_control_signal():
     lnp = scipy.special.log_softmax(p*100, -1)
     lnp0 = automatic_policy(p_g, lnp) 
     # first try no future planning, then we should get u = R
-    u = control_signal(R, lnp, lnp0, gamma=1, alpha=0)
+    u = control_signal(R, lnp, lnp0, gain=1, discount=0)
     #assert is_close(u, R).all() # NANs!
 
-    u = control_signal(R, lnp, lnp0, gamma=1, alpha=1)
+    u = control_signal(R, lnp, lnp0, gain=1, discount=1)
     # utility of 00b is 0 + 0 + 1 + ln p(b | ba). p(b | ba) = 1 so we should get 1
     assert u[1, 1, 0, 1] == 1
     assert u[1, EMPTY, 1, 0] == 1    
@@ -745,7 +916,7 @@ def test_value():
     # ab -> 1+20
     # ba -> 2+100
     # bb -> 2+200
-    # so with alpha=1,
+    # so with discount=1,
     # v(a) = 1 + 10 + 20 = 31
     # v(b) = 2 + 100 + 200 = 302
     l = np.array([[ # 1 x 3 x 2
@@ -934,17 +1105,24 @@ def test_add_corr():
 def figures():
     # short before long
     print("Generating shortlong grid...", file=sys.stderr)
-    dfsl = shortlong_grid(tie_init=False, eps=1/5)
+    dfsl = shortlong_grid(tie_init=False, eps=1/5, method=policy_iteration)
     dfsl.to_csv("output/shortlong.csv")
 
     # filled pause
     print("Generating filled-pause simulations...", file=sys.stderr)
-    df, policy = fp_figures()
+    df, policy_df, lnp, lnp0, R_fp = fp_figures(method=policy_iteration)
     df.to_csv("output/fp_summary.csv")
-    policy.to_csv("output/fp_policy.csv")
+    policy_df.to_csv("output/fp_policy.csv")
 
     print("Generating correction simulations...", file=sys.stderr)
-    dfs = stutter_grid(pad=4, gamma_max=5, alpha_min=.95, gamma_steps=50, alpha_steps=5, tie_init=False, eps=1/5)
+    dfs = stutter_grid(pad=4,
+                       gain_max=5,
+                       discount_min=.95,
+                       gain_steps=50,
+                       discount_steps=5,
+                       tie_init=False,
+                       eps=1/5,
+                       method=policy_iteration)
     dfs.to_csv("output/stutter.csv")
     
 if __name__ == '__main__':
