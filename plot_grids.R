@@ -1,3 +1,4 @@
+rm(list=ls())
 library(tidyverse)
 library(viridis)
 library(latex2exp)
@@ -18,16 +19,20 @@ dsl %>%
   geom_point(shape=15) +
   theme_classic() +
   #scale_color_gradient2(low="red", high="blue", midpoint=1/2) +
-  scale_color_viridis() +
   ylim(0, 1) +
-  labs(x=TeX("Gain $\\gamma$"), 
-       y=TeX("Discount $\\alpha$"),
-       #color=TeX("$\\ln \\frac{p_{g_1}(a)}{p_{g_1}(b)}$")) +
-       color=TeX("$\\frac{p_{g_1}(short)}{p_{g_1}(short) + p_{g_1}(long)}$")) +
-  theme(legend.title=element_text(size=7)) +
-  ggtitle("Short-before-long preference")
-
-ggsave("plots/shortlong.pdf", width=5, height=3.3)
+  labs(x=TeX("Control Gain $\\alpha$"), 
+       y=TeX("Future Discount $\\gamma$"), 
+       color="") +
+  theme(legend.position="right",
+        legend.title=element_text(size=9),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-5,-5,-5,-5)) +
+  scale_color_viridis(guide = guide_colorbar(title.position="bottom", 
+                                             label.position="right"))
+                                             #barwidth=7,
+                                             #barheight=.5))
+  
+ggsave("plots/shortlong.pdf", width=3.75, height=2)
 
 
 # FILLED PAUSE
@@ -39,128 +44,42 @@ dfl_policy = read_csv("output/fp_policy.csv") %>%
 dfl_policy %>%
   ggplot(aes(x=factor(x, levels=c("5", "4", "3", "2", "1", "0")),
              y=as.factor(g), 
-             fill=p_L,
-             color=p_L)) +
-  geom_tile() +
-  scale_x_discrete(labels=c(
-    TeX("$x_5$"),
-    TeX("$x_4$"), 
-    TeX("$x_3$"), 
-    TeX("$x_2$"),
-    TeX("$x_1$"), 
-    TeX("$e$")
-  )) +
-  scale_fill_viridis() +
-  scale_color_viridis() +
-  coord_flip() +
-  labs(x="Action x", y="Goal g", fill=TeX("$p_L(w_g | x)$")) +
-  guides(color="none") +
-  theme_classic() +
-  ggtitle(TeX("A. Listener model"))
-
-#ggsave("plots/fp_listener.pdf", height=4, width=3.5)
-
-dfl_policy %>%
-  ggplot(aes(x=factor(x, levels=c("5", "4", "3", "2", "1", "0")),
-             y=as.factor(g), 
              fill=R_g)) +
   geom_tile(color="black") +
   scale_x_discrete(labels=c(
-    TeX("$x_5$"),
-    TeX("$x_4$"), 
-    TeX("$x_3$"), 
-    TeX("$x_2$"),
-    TeX("$x_1$"), 
+    TeX("$a_5$"),
+    TeX("$a_4$"), 
+    TeX("$a_3$"), 
+    TeX("$a_2$"),
+    TeX("$a_1$"), 
     TeX("$e$")
   )) +
-  scale_fill_gradient2(low="blue", high="red", midpoint=0) +
+  #scale_fill_gradient2(low="yellow", high="blue", midpoint=0) +
+  scale_fill_viridis() +
   coord_flip() +
-  labs(x="Action x", y="Goal g", fill=TeX("$R_g(x)$")) +
+  labs(x="Action a", y="Goal g", fill=TeX("$R_g(a)$")) +
   guides(color="none") +
-  theme_empty() +
+  theme_classic() +
+  theme(line=element_blank()) +
   ggtitle(TeX("A. Reward with filled pause e"))
 
 ggsave("plots/fp_reward.pdf", height=4, width=3.5)
 
-
-dfl_policy %>%
-  ggplot(aes(x=factor(x, levels=c("5", "4", "3", "2", "1", "0")),
-             y=as.factor(g), 
-             fill=exp(`lnp_g(x)`),
-             color=exp(`lnp_g(x)`))) +
-    geom_tile() +
-  scale_x_discrete(labels=c(
-    TeX("$x_5$"),
-    TeX("$x_4$"), 
-    TeX("$x_3$"), 
-    TeX("$x_2$"),
-    TeX("$x_1$"), 
-    TeX("$e$")
-  )) +
-  scale_fill_viridis() +
-  scale_color_viridis() +
-  coord_flip() +
-  labs(x="Action x", y="Goal g", fill=TeX("$\\ln p_g(x)$")) +
-  guides(color="none") +
-  theme_classic() +
-  ggtitle(TeX("B. Policy with filled pause $e$"))
-
-#ggsave("plots/fp_policy.pdf", height=4, width=3.5)
-
-dfl_policy %>%
-  ggplot(aes(x=factor(x, levels=c("5", "4", "3", "2", "1", "0")),
-             y=as.factor(g), 
-             fill=exp(`lnp_g(x)`),
-             color=exp(`lnp_g(x)`))) +
-  geom_tile() +
-  scale_x_discrete(labels=c(
-    TeX("$x_5$"),
-    TeX("$x_4$"), 
-    TeX("$x_3$"), 
-    TeX("$x_2$"),
-    TeX("$x_1$"), 
-    TeX("$e$")
-  )) +
-  scale_fill_viridis() +
-  scale_color_viridis() +
-  coord_flip() +
-  labs(x="Action x", y="Goal g", fill=TeX("$\\ln p_g(x)$")) +
-  guides(color="none") +
-  theme_classic() +
-  ggtitle(TeX("B. Policy with filled pause $e$"))
-
-
 dfl = read_csv("output/fp_summary.csv") %>%
-  select(-`...1`)
+  select(-`...1`) %>%
+  mutate(g=1:nrow(.)) 
 
 dfl %>%
-  gather(measure, value, -DR) %>%
-  filter(measure != "p0(x)") %>%
-  ggplot(aes(x=DR, y=log(value), color=measure)) +
-    geom_line(size=1) +
-    geom_point() +
-    theme_classic() +
-    labs(x=TeX("$\\Delta R_{g}$"),
-         y="Log Probability") +
-    guides(color="none") +
-    annotate("text", x=1.75, y=-.7, color="black", hjust=0, label=TeX("$p_{g}(x_g)$"), group=1) +
-    annotate("text", x=1.75, y=-1.6, color="black", hjust=0, label=TeX("$p_0(x_g | e)$"), group=1) +
-    annotate("text", x=1.75, y=-3.1, color="black", hjust=0, label=TeX("$p_{g}(e)$"), group=1) +
-    ggtitle("B. Effect of signal strength")
-
-#ggsave("plots/fp_strength.pdf", height=4, width=3)
-
-dfl %>%
-  select(-`p0(x)`, -`p0(x|ε)`) %>%
-  ggplot(aes(x=DR, y=`p_{g_x}(ε)`, color=`p_{g_x}(x)`)) +
+  ggplot(aes(x=g, y=`p_{g_x}(ε)`, color=`p_{g_x}(x)`)) +
     geom_line(size=2) +
     geom_point(size=3) +
     theme_classic() +
-    labs(x=TeX("$\\Delta R_{g}$"),
-         y=TeX("Controlled $p_g(e)$"),
-         color=TeX("$p_g(x_g)$")) +
-    theme(legend.position=c(.28, .3)) +
+    labs(x=TeX("Goal $g$"),
+         y=TeX("Filled pause probability $\\pi_g(e)$"),
+         color=TeX("$\\pi_g(a_g)$")) +
+    theme(legend.position=c(.8, .7)) +
     scale_color_viridis() +
+  
     ggtitle("B. Filled pause probability")
 
 ggsave("plots/fp_prob.pdf", height=4, width=3)
@@ -168,28 +87,25 @@ ggsave("plots/fp_prob.pdf", height=4, width=3)
 
 
 dfl %>%
-  ggplot(aes(x=`p_{g_x}(x)`, y=`p0(x|ε)`, color=DR)) +
+  ggplot(aes(x=factor(g), color=`p_{g_x}(x)`, y=`p0(x|ε)`, group=factor(1))) +
   geom_point(size=3) +
   geom_line(size=2) +
   theme_classic() +
   scale_color_viridis() +
-  labs(color=TeX("$\\Delta R_{g}$"),
-       y=TeX("Automatic $p_0(x_g | e)$"),
-       x=TeX("$p_{g}(x_g)$")) +
-  theme(legend.position=c(.3, .3)) +
+  labs(color=TeX("$\\pi_g(a_g)$"),
+       y=TeX("Automatic probability after filled pause $\\pi_0(a | e)$"),
+       x=TeX("Action $a$")) +
+  scale_x_discrete(labels=c(
+    TeX("$a_1$"),
+    TeX("$a_2$"), 
+    TeX("$a_3$"), 
+    TeX("$a_4$"),
+    TeX("$a_5$") 
+  )) +  
+  theme(legend.position=c(.8, .7)) +
   ggtitle(TeX("C. Automatic policy after e"))
 
 ggsave("plots/fp_after.pdf", height=4, width=3)
-
-dfl %>%
-  ggplot(aes(x=`p0(x|ε)`, y=`p_{g_x}(ε)`, color=DR)) +
-  geom_point() +
-  geom_line() +
-  theme_classic() +
-  labs(color=TeX("$\\Delta R_{g_x}$"),
-       x=TeX("Automatic $p_0(x | e)$"),
-       y=TeX("Controlled $p_{g_x}(e)$")) +
-  theme(legend.position=c(.3, .4))
 
 # CORRECTIONS AND FALSE STARTS
 
@@ -201,18 +117,17 @@ dfs %>%
   gather(measure, value, -alpha, -gamma) %>%
   filter(measure %in% c("healthy_corr", "pathological_corr")) %>%
   ggplot(aes(x=gamma, y=value, color=measure)) +
-    geom_line(alpha=.7, size=3) +
+    geom_line(alpha=.7, size=2) +
     theme_classic() +
-    labs(x=TeX("Gain $\\gamma$"), 
-         y=TeX("Probability"),
+    xlim(1, NA) +
+    labs(x=TeX("Control gain $\\alpha$"), 
+         y=TeX("Probability of correction"),
          color="") +
-    scale_color_hue(labels=c(TeX("Correction $p_g(c | x_{\\neq g})$"), 
-                             TeX("False start $p_g(c | x_g)$"))) +
+    scale_color_hue(labels=c(TeX("After error $\\pi_g(c | a_{\\neq g})$"), 
+                             TeX("False start $\\pi_g(c | a_g)$"))) +
     theme(legend.position=c(.65, .5)) +
     ggtitle("D. Corrections and false starts")
 
 ggsave("plots/corr_falsestart.pdf", width=3, height=4)
 
-
-dfs %>%
   
