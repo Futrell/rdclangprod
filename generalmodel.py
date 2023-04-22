@@ -1105,12 +1105,12 @@ def test_add_corr():
 def figures():
     # short before long
     print("Generating shortlong grid...", file=sys.stderr)
-    dfsl = shortlong_grid(tie_init=False, eps=1/5, method=policy_iteration)
+    dfsl = shortlong_grid(tie_init=False, eps=1/5)
     dfsl.to_csv("output/shortlong.csv")
 
     # filled pause
     print("Generating filled-pause simulations...", file=sys.stderr)
-    df, policy_df, lnp, lnp0, R_fp = fp_figures(method=policy_iteration)
+    df, policy_df, lnp, lnp0, R_fp = fp_figures()
     df.to_csv("output/fp_summary.csv")
     policy_df.to_csv("output/fp_policy.csv")
 
@@ -1121,8 +1121,7 @@ def figures():
                        gain_steps=50,
                        discount_steps=5,
                        tie_init=False,
-                       eps=1/5,
-                       method=policy_iteration)
+                       eps=1/5)
     dfs.to_csv("output/stutter.csv")
     
 if __name__ == '__main__':
