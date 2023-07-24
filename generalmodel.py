@@ -151,11 +151,11 @@ def value(lnp, local_value, discount=1, B=0):
         v[curr] = v[curr] + discount * shift_right(continuation_value, B + 1)
     return v
 
-def control_signal(R, lnp, lnp0, gain, discount, costgain=1, lmbda=1, B=0):
-    control_cost = (1/lmbda)*(lnp - lnp0)
-    local_value = gain * R - costgain * control_cost
+def control_signal(R, lnp, lnp0, gain, discount, B=0):
+    control_cost = lnp - lnp0
+    local_value = gain * R - control_cost
     v = value(lnp, local_value, discount, B=B) # v = gain*R - control_cost + discount*v'
-    return v + costgain * control_cost # u = gain*R + discount*v' = v + control_cost
+    return v + control_cost # u = gain*R + discount*v' = v + control_cost
 
 def z_iteration(R,
                 p_g=None,
@@ -224,9 +224,7 @@ def z_iteration(R,
 def policy_iteration(R,                    
                      p_g=None,             
                      gain=1,              
-                     discount=1,              
-                     lmbda=1,              
-                     costgain=1,           
+                     discount=1,
                      num_iter=1000,
                      tol=TOL,
                      init_temperature=100, 
@@ -249,8 +247,6 @@ def policy_iteration(R,
     p_g: A need distribution over goals, shape B*G where B is a batch dimension and G is goals.
     gain: Control gain.
     discount: Discount rate.
-    lmbda: Inverse penalty for control information.
-    costgain: Relative importance of cost in future planning calculation. Set to 0 to constrain information rate.
     num_iter: Maximum number of policy iteration steps.
     tol: If not None, the sum-squared-error convergence criterion.    
     init_temperature: Temperature for random energy initialization.
@@ -289,22 +285,22 @@ def policy_iteration(R,
         if fit_lnp0:
             lnp0 = automatic_policy(p_g, lnp, B=B)
 
-        u = control_signal(R, lnp, lnp0, gain, discount, lmbda=lmbda, costgain=costgain, B=B)
+        u = control_signal(R, lnp, lnp0, gain, discount, B=B)
         
         if print_loss:
             if T == 1:
-                print((p_g @ scipy.special.logsumexp(lnp0 + lmbda*u, -1)).item())
+                print((p_g @ scipy.special.logsumexp(lnp0 + u, -1)).item())
             else:
-                print((p_g @ scipy.special.logsumexp(lnp0 + lmbda*u, -1)[:, (EMPTY,)*(T-1)]).item())
+                print((p_g @ scipy.special.logsumexp(lnp0 + u, -1)[:, (EMPTY,)*(T-1)]).item())
         
-        lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
+        lnp = scipy.special.log_softmax(lnp0 + u, -1)
         for k in range(extra_pi_steps):
-            u = control_signal(R, lnp, lnp0, gain, discount, lmbda=lmbda, costgain=costgain, B=B)
-            lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
+            u = control_signal(R, lnp, lnp0, gain, discount, B=B)
+            lnp = scipy.special.log_softmax(lnp0 + u, -1)
         if fit_lnp0:
             for k in range(extra_ba_steps):
                 lnp0 = automatic_policy(p_g, lnp, B=B)
-                lnp = scipy.special.log_softmax(lnp0 + lmbda*u, -1)
+                lnp = scipy.special.log_softmax(lnp0 + u, -1)
 
         # Check convergence
         diff = np.sum(np.abs(np.exp(lnp) - np.exp(old_lnp)))
@@ -318,14 +314,14 @@ def policy_iteration(R,
     else:
         return lnp
 
-def loss_u(R, lnp, gain, discount, p_g=None, lmbda=1):
+def loss_u(R, lnp, gain, discount, p_g=None):
     T = R.ndim - 1
     if p_g is None:
         G = R.shape[0]
         p_g = np.ones(G)/G
     lnp0 = automatic_policy(p_g, lnp)
-    u = control_signal(R, lnp, lnp0, gain, discount, lmbda=lmbda)
-    return p_g @ (scipy.special.logsumexp(lnp0 + lmbda*u, -1))[:, (EMPTY,)*(T-1)]
+    u = control_signal(R, lnp, lnp0, gain, discount)
+    return p_g @ (scipy.special.logsumexp(lnp0 + u, -1))[:, (EMPTY,)*(T-1)]
 
     
 def pad_R(R, T=1):
@@ -649,7 +645,7 @@ def fp_figures(V=5, epsilon=1/5, weight=1, gain=1.5, discount=1, method=policy_i
     dfm = pd.melt(df, id_vars=['DR'])
     return df, policy_df, lnp, lnp0, R_padded
 
-def fp_listener(V, epsilon=1/5, weight=1, which='distractors'):
+def fp_listener(V, epsilon=1/5, weight=1, which='neither'):
     lang = [
         [(v+1,0),
          (0,v+1)]
