@@ -14,8 +14,6 @@ EPSILON = 10 ** -3
 NUM_ITER = 100
 STEPS = 1
 MODEL = "gpt2"
-DEBUG = False
-K = 1000 
 
 def lm_probs(tokenizer, model, prefix, suffix, complementizer="that", steps=STEPS):
     """ get p(suffix | prefix) + p(that suffix | prefix) and p(that | prefix) """
@@ -33,14 +31,14 @@ def lm_probs(tokenizer, model, prefix, suffix, complementizer="that", steps=STEP
     return one.item(), two.item(), torch.logaddexp(one, two).item(), lnp_comp.item()
 
 def compdrop_grid(**kwds):
-    num_verbs = 2
+    num_nouns = 2
     num_rcs = 4
     
     def f(policies):
-        lnpcomp_hf = policies[..., 0, EMPTY, 2, 1]           # p(that | V0, g=V0 R0) -- high prob,    high entropy
-        lnpcomp_lf = policies[..., 1, EMPTY, 2, 1]           # p(that | V0, g=V0 R1) -- low prob,     high entropy
-        lnpcomp_hf2 = policies[..., num_rcs+1, EMPTY, 3, 1]    # p(that | V1, g=V1 R1) -- high prob,    low entropy            
-        
+        lnpcomp_hf = policies[..., 0, EMPTY, 2, 1]           # p(that | N0, g=N0 R0) -- high prob,    high entropy
+        lnpcomp_lf = policies[..., 1, EMPTY, 2, 1]           # p(that | N0, g=N0 R1) -- low prob,     high entropy
+        lnpcomp_hf2 = policies[..., num_rcs+1, EMPTY, 3, 1]  # p(that | N1, g=N1 R1) -- high prob,    low entropy
+
         return {
             'lnpcomp_hf': lnpcomp_hf,
             'lnpcomp_lf': lnpcomp_lf,
@@ -50,7 +48,7 @@ def compdrop_grid(**kwds):
         }
     # in compdrop_R, 0 is stop, 1 is that, 2-3 are verbs, 4 is the first noun
     R = compdrop_R(
-        num_verbs=num_verbs,
+        num_nouns=num_nouns,
         num_rcs=num_rcs,
         num_nouns=0
     )
@@ -60,16 +58,16 @@ def compdrop_grid(**kwds):
     ])
     return grid(f, R, p_g=p_g, **kwds)
 
-def compdrop_lang(num_verbs=1, num_nouns=1, num_rcs=1, the=False):
+def compdrop_lang(num_nouns=1, num_nouns=1, num_rcs=1, the=False):
     # 0 = stop symbol
     # 1 = that
     # optionally 2=the
-    # 2:2+num_verbs = verbs
-    # 2+num_verbs:2+num_verbs+num_rcs = rcs
+    # 2:2+num_nouns = verbs
+    # 2+num_nouns:2+num_nouns+num_rcs = rcs
     # finally nouns
-    verbs = range(2+the, 2+the+num_verbs)
-    rcs = range(2+the+num_verbs, 2+the+num_verbs+num_rcs)
-    nouns = range(2+the+num_verbs+num_rcs, 2+the+num_verbs+num_rcs+num_nouns)
+    verbs = range(2+the, 2+the+num_nouns)
+    rcs = range(2+the+num_nouns, 2+the+num_nouns+num_rcs)
+    nouns = range(2+the+num_nouns+num_rcs, 2+the+num_nouns+num_rcs+num_nouns)
 
     rc_sentences = list(itertools.product(verbs, rcs))
     rc_c_sentences = [(v,1,r) for v,r in rc_sentences]
@@ -84,8 +82,8 @@ def compdrop_lang(num_verbs=1, num_nouns=1, num_rcs=1, the=False):
     utterances = rc_utterances + noun_utterances
     return utterances
 
-def compdrop_R(num_verbs=1, num_nouns=1, num_rcs=1, the=False, **kwds):
-    lang = compdrop_lang(num_verbs=num_verbs, num_nouns=num_nouns, num_rcs=num_rcs, the=the)
+def compdrop_R(num_nouns=1, num_nouns=1, num_rcs=1, the=False, **kwds):
+    lang = compdrop_lang(num_nouns=num_nouns, num_nouns=num_nouns, num_rcs=num_rcs, the=the)
     return encode_simple_lang(lang, **kwds)
 
 def main():
