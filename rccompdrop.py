@@ -50,7 +50,7 @@ def compdrop_grid(**kwds):
     R = compdrop_R(
         num_nouns=num_nouns,
         num_rcs=num_rcs,
-        num_nouns=0
+        num_other=0
     )
     p_g = np.array([
         1/2, 3/12, 2/12, 1/12, # the 3/12 
@@ -58,32 +58,29 @@ def compdrop_grid(**kwds):
     ])
     return grid(f, R, p_g=p_g, **kwds)
 
-def compdrop_lang(num_nouns=1, num_nouns=1, num_rcs=1, the=False):
+def compdrop_lang(num_nouns=1, num_other=1, num_rcs=1):
     # 0 = stop symbol
     # 1 = that
     # optionally 2=the
     # 2:2+num_nouns = verbs
     # 2+num_nouns:2+num_nouns+num_rcs = rcs
     # finally nouns
-    verbs = range(2+the, 2+the+num_nouns)
-    rcs = range(2+the+num_nouns, 2+the+num_nouns+num_rcs)
-    nouns = range(2+the+num_nouns+num_rcs, 2+the+num_nouns+num_rcs+num_nouns)
+    nouns = range(2, 2+num_nouns)
+    rcs = range(2+num_nouns, 2+num_nouns+num_rcs)
+    others = range(2+num_nouns+num_rcs, 2+num_nouns+num_rcs+num_other)
 
-    rc_sentences = list(itertools.product(verbs, rcs))
+    rc_sentences = list(itertools.product(nouns, rcs))
     rc_c_sentences = [(v,1,r) for v,r in rc_sentences]
     rc_null_sentences = [(v,r,0) for v,r in rc_sentences]
-    if the:
-        noun_sentences = [(v,2,n) for v,n in itertools.product(verbs, nouns)]
-    else:
-        noun_sentences = [(v,n,0) for v,n in itertools.product(verbs, nouns)]
+    other_sentences = [(v,n,0) for v,n in itertools.product(nouns, others)]
     rc_utterances = list(zip(rc_c_sentences, rc_null_sentences))
-    noun_utterances = [(ns,) for ns in noun_sentences]
+    other_utterances = [(ns,) for ns in other_sentences]
 
-    utterances = rc_utterances + noun_utterances
+    utterances = rc_utterances + other_utterances
     return utterances
 
-def compdrop_R(num_nouns=1, num_nouns=1, num_rcs=1, the=False, **kwds):
-    lang = compdrop_lang(num_nouns=num_nouns, num_nouns=num_nouns, num_rcs=num_rcs, the=the)
+def compdrop_R(num_nouns=1, num_other=1, num_rcs=1, **kwds):
+    lang = compdrop_lang(num_nouns=num_nouns, num_other=num_other, num_rcs=num_rcs)
     return encode_simple_lang(lang, **kwds)
 
 def main():
