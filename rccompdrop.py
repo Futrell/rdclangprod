@@ -10,7 +10,6 @@ from transformers import AutoTokenizer, AutoModelWithLMHead
 from generalmodel import EMPTY, grid, encode_simple_lang
 
 GAIN_MAX = 3
-EPSILON = 10 ** -3
 NUM_ITER = 100
 STEPS = 1
 MODEL = "gpt2"
@@ -58,10 +57,9 @@ def compdrop_grid(**kwds):
     ])
     return grid(f, R, p_g=p_g, **kwds)
 
-def compdrop_lang(num_nouns=1, num_other=1, num_rcs=1):
+def compdrop_lang(num_nouns=1, num_other=0, num_rcs=1):
     # 0 = stop symbol
     # 1 = that
-    # optionally 2=the
     # 2:2+num_nouns = verbs
     # 2+num_nouns:2+num_nouns+num_rcs = rcs
     # finally nouns
@@ -77,9 +75,10 @@ def compdrop_lang(num_nouns=1, num_other=1, num_rcs=1):
     other_utterances = [(ns,) for ns in other_sentences]
 
     utterances = rc_utterances + other_utterances
+    
     return utterances
 
-def compdrop_R(num_nouns=1, num_other=1, num_rcs=1, **kwds):
+def compdrop_R(num_nouns=1, num_other=0, num_rcs=1, **kwds):
     lang = compdrop_lang(num_nouns=num_nouns, num_other=num_other, num_rcs=num_rcs)
     return encode_simple_lang(lang, **kwds)
 
