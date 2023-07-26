@@ -8,6 +8,7 @@ import tqdm
 from transformers import AutoTokenizer, AutoModelWithLMHead
 
 from generalmodel import EMPTY, grid, encode_simple_lang
+import generalmodel as g
 
 GAIN_MAX = 3
 NUM_ITER = 100
@@ -57,10 +58,33 @@ def compdrop_grid(**kwds):
     ])
     return grid(f, R, p_g=p_g, **kwds)
 
+def compdrop_verb(gain=1.01, discount=.99, epsilon=.001, method=g.z_iteration, num_iter=10000):
+    """ Show complementizer dropping as a function of p(clause | context) """
+    lang = compdrop_lang(num_nouns=2, num_rcs=5, num_other=5)
+    R = encode_simple_lang(sorted(lang), epsilon=epsilon)
+    p_g =  np.array([8, 4, 4, 2, 2,   # V1 C
+                     4, 2, 2, 1, 1,   # V1 N
+                     4, 2, 2, 1, 1,   # V2 C
+                     8, 4, 4, 2, 2,]) # V2 N
+    p_g = p_g / p_g.sum()
+    lnp, lnp0 = method(R,
+                       p_g=p_g,
+                       gain=gain,
+                       discount=discount,
+                       monitor=True,
+                       return_default=True,
+                       num_iter=num_iter)
+    lnpcomp_frequent = lnp[0,EMPTY,2,1]
+    lnpclause_frequent = lnp[0,EMPTY,2,4]
+    lnpcomp_infrequent = lnp[10,EMPTY,3,1]
+    lnpclause_infrequent = lnp[10,EMPTY,3,4]
+
+    return lnpcomp_frequent, lnpcomp_infrequent, lnpcomp_infrequent > lnpcomp_frequent
+
 def compdrop_lang(num_nouns=1, num_other=0, num_rcs=1):
     # 0 = stop symbol
     # 1 = that
-    # 2:2+num_nouns = verbs
+    # 2:2+num_nouns = nouns
     # 2+num_nouns:2+num_nouns+num_rcs = rcs
     # finally nouns
     nouns = range(2, 2+num_nouns)
